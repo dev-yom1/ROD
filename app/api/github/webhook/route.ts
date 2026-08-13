@@ -1,5 +1,9 @@
 import { start } from "workflow/api";
-import { githubConfig } from "../../../../lib/config";
+import { deliveryClaimConfig, githubConfig } from "../../../../lib/config";
+import {
+  claimGitHubDelivery,
+  releaseGitHubDeliveryClaim,
+} from "../../../../lib/github/delivery-claim";
 import { verifyGitHubSignature } from "../../../../lib/github/signature";
 import { diagnosePullRequestWorkflow } from "../../../../workflows/diagnose-pull-request";
 
@@ -54,21 +58,51 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const run = await start(diagnosePullRequestWorkflow, [{
-    deliveryId,
-    installationId,
-    baseRepository,
-    sourceRepository,
-    pullNumber,
-    headSha,
-  }]);
+  const claimConfig = deliveryClaimConfig();
+  const claimed = await claimGitHubDelivery(deliveryId, claimConfig);
+  if (!claimed.claimed) {
+    console.log(
+      `[ROD webhook] suppressed duplicate delivery=${deliveryId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
+    );
+    return Response.json(
+      { ok: true, accepted: false, duplicate: true, deliveryId },
+      { status: 202 },
+    );
+  }
 
-  console.log(
-    `[ROD webhook] started workflow run=${run.runId} delivery=${deliveryId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
-  );
+  try {
+    const run = await start(diagnosePullRequestWorkflow, [{
+      deliveryId,
+      deliveryClaimToken: claimed.claim.token,
+      installationId,
+      baseRepository,
+      sourceRepository,
+      pullNumber,
+      headSha,
+    }]);
 
-  return Response.json(
-    { ok: true, accepted: true, runId: run.runId, deliveryId },
-    { status: 202 },
-  );
+    console.log(
+      `[ROD webhook] started workflow run=${run.runId} delivery=${deliveryId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
+    );
+
+    return Response.json(
+      { ok: true, accepted: true, runId: run.runId, deliveryId },
+      { status: 202 },
+    );
+  } catch (error) {
+    const released = await releaseGitHubDeliveryClaim(claimed.claim, claimConfig).catch(
+      (releaseError) => {
+        console.error(
+          `[ROD webhook] failed to release pending delivery=${deliveryId} after start error`,
+          releaseError,
+        );
+        return false;
+      },
+    );
+    console.error(
+      `[ROD webhook] workflow start failed delivery=${deliveryId} pendingClaimReleased=${released}`,
+      error,
+    );
+    throw error;
+  }
 }
