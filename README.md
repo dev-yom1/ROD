@@ -29,7 +29,7 @@ Workflow SDK
   └─ durable diagnosis step
         │
         ├─ verify PR head SHA
-        ├─ reuse PR+SHA Check Run on retry
+        ├─ reuse this Workflow run's Check Run on retry
         ├─ read README/runtime metadata
         ├─ download source archive
         ├─ verify PR head again before Sandbox allocation
@@ -59,7 +59,7 @@ ROD uses the Workflow SDK so the webhook request is no longer responsible for ke
 
 A run can become obsolete when a newer `synchronize` event arrives. ROD therefore checks the PR head before creating work, again immediately before Sandbox allocation, and around report publication. Obsolete runs finish without replacing the current PR report.
 
-Workflow steps may retry, so Check Runs use a stable external identity based on PR number + head SHA. A retry reuses the ROD-owned Check Run instead of creating another one.
+Workflow steps retry unhandled failures. Check Runs therefore use the Workflow run ID as their retry identity: retries inside the same Workflow run reuse the same ROD-owned Check Run, while a separate Workflow run cannot overwrite that run's Check status. A final failure is written only after the diagnosis step has exhausted its retries.
 
 Useful local inspection commands:
 
@@ -163,6 +163,8 @@ npm test
 npm run typecheck
 npm run build
 ```
+
+The Workflow TypeScript plugin is enabled alongside the Next.js plugin in `tsconfig.json` so editor/type tooling understands the Workflow directives.
 
 ## Current limits
 
