@@ -32,7 +32,7 @@ export function renderReport(
     ? `\n\nObserved app URL: \`${observedUrl}\`${httpStatus !== null ? ` (HTTP ${httpStatus})` : ""}`
     : "";
   const body = findings.length ? findings.map(renderFinding).join("\n\n---\n\n") : "";
-  return `${REPORT_MARKER}\n## 🩺 Repo Onboarding Doctor\n\n${summary}${runtime}\n\nCommit: \`${headSha.slice(0, 12)}\`${body ? `\n\n${body}` : ""}\n\n<sub>ROD runs setup in an isolated fresh environment and never forwards the GitHub App installation token into repository code.</sub>`;
+  return `${REPORT_MARKER}\n<!-- rod-head:${headSha} -->\n## 🩺 Repo Onboarding Doctor\n\n${summary}${runtime}\n\nCommit: \`${headSha.slice(0, 12)}\`${body ? `\n\n${body}` : ""}\n\n<sub>ROD runs setup in an isolated fresh environment and never forwards the GitHub App installation token into repository code.</sub>`;
 }
 
 export async function createCheckRun(octokit: Octokit, owner: string, repo: string, headSha: string): Promise<number> {
@@ -146,21 +146,55 @@ async function markerComments(octokit: Octokit, owner: string, repo: string, pul
     .sort((a, b) => a.id - b.id);
 }
 
-async function deleteDuplicateReports(
+async function deleteSameHeadDuplicateReports(
   octokit: Octokit,
   owner: string,
   repo: string,
   canonicalId: number,
-  comments: Array<{ id: number }>,
+  comments: Array<{ id: number; body?: string | null }>,
+  expectedHeadSha: string,
 ): Promise<void> {
+  const headMarker = `<!-- rod-head:${expectedHeadSha} -->`;
   for (const comment of comments) {
-    if (comment.id === canonicalId) continue;
+    if (comment.id === canonicalId || !comment.body?.includes(headMarker)) continue;
     await octokit.request("DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}", {
       owner,
       repo,
       comment_id: comment.id,
     }).catch(() => undefined);
   }
+}
+
+async function removeReportIfStillMatching(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  report: string,
+): Promise<void> {
+  const comments = await markerComments(octokit, owner, repo, pullNumber);
+  for (const comment of comments) {
+    if (comment.body !== report) continue;
+    await octokit.request("DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}", {
+      owner,
+      repo,
+      comment_id: comment.id,
+    }).catch(() => undefined);
+  }
+}
+
+async function verifyHeadAfterWrite(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  expectedHeadSha: string,
+  report: string,
+): Promise<{ current: boolean; headSha: string }> {
+  const headSha = await getCurrentPullHeadSha(octokit, owner, repo, pullNumber);
+  if (headSha === expectedHeadSha) return { current: true, headSha };
+  await removeReportIfStillMatching(octokit, owner, repo, pullNumber, report);
+  return { current: false, headSha };
 }
 
 export async function upsertPullRequestReport(
@@ -186,8 +220,19 @@ export async function upsertPullRequestReport(
       comment_id: canonical.id,
       body: report,
     });
-    await deleteDuplicateReports(octokit, owner, repo, canonical.id, comments);
-    return { updated: true, currentHeadSha };
+
+    const afterPatch = await verifyHeadAfterWrite(
+      octokit, owner, repo, pullNumber, expectedHeadSha, report,
+    );
+    if (!afterPatch.current) return { updated: false, currentHeadSha: afterPatch.headSha };
+
+    comments = await markerComments(octokit, owner, repo, pullNumber);
+    await deleteSameHeadDuplicateReports(octokit, owner, repo, canonical.id, comments, expectedHeadSha);
+
+    const finalCheck = await verifyHeadAfterWrite(
+      octokit, owner, repo, pullNumber, expectedHeadSha, report,
+    );
+    return { updated: finalCheck.current, currentHeadSha: finalCheck.headSha };
   }
 
   const created = await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
@@ -198,9 +243,16 @@ export async function upsertPullRequestReport(
   });
   const createdId = (created.data as { id: number }).id;
 
+  const afterCreate = await verifyHeadAfterWrite(
+    octokit, owner, repo, pullNumber, expectedHeadSha, report,
+  );
+  if (!afterCreate.current) return { updated: false, currentHeadSha: afterCreate.headSha };
+
   // Converge same-head concurrent first runs back to one marker comment.
   comments = await markerComments(octokit, owner, repo, pullNumber);
-  const canonical = comments[0] ?? { id: createdId };
+  const sameHeadMarker = `<!-- rod-head:${expectedHeadSha} -->`;
+  const sameHeadComments = comments.filter((comment) => comment.body?.includes(sameHeadMarker));
+  const canonical = sameHeadComments[0] ?? comments[0] ?? { id: createdId, body: report };
   if (canonical.id !== createdId) {
     await octokit.request("PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}", {
       owner,
@@ -208,7 +260,20 @@ export async function upsertPullRequestReport(
       comment_id: canonical.id,
       body: report,
     });
+
+    const afterConvergePatch = await verifyHeadAfterWrite(
+      octokit, owner, repo, pullNumber, expectedHeadSha, report,
+    );
+    if (!afterConvergePatch.current) {
+      return { updated: false, currentHeadSha: afterConvergePatch.headSha };
+    }
   }
-  await deleteDuplicateReports(octokit, owner, repo, canonical.id, comments);
-  return { updated: true, currentHeadSha };
+
+  comments = await markerComments(octokit, owner, repo, pullNumber);
+  await deleteSameHeadDuplicateReports(octokit, owner, repo, canonical.id, comments, expectedHeadSha);
+
+  const finalCheck = await verifyHeadAfterWrite(
+    octokit, owner, repo, pullNumber, expectedHeadSha, report,
+  );
+  return { updated: finalCheck.current, currentHeadSha: finalCheck.headSha };
 }
