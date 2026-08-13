@@ -1,6 +1,7 @@
 import type { ReadmePlan } from "./types";
 
 const SHELL_FENCE = /```(?:bash|sh|shell|zsh|console)?\s*\n([\s\S]*?)```/gi;
+const ENV_COPY = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?(?:\s|$)/i;
 
 function cleanShellLine(line: string): string | null {
   const cleaned = line.trim().replace(/^\$\s+/, "");
@@ -25,10 +26,23 @@ function firstMatch(commands: string[], patterns: RegExp[]): string | null {
 }
 
 function extractRuntime(markdown: string, runtime: "node" | "python"): string | null {
-  const pattern = runtime === "node"
-    ? /\b(?:Node(?:\.js)?|node)\s*(?:version|v|>=|=|:)?\s*(\d+(?:\.\d+){0,2}(?:\s*(?:LTS|\+))?)/i
-    : /\bPython\s*(?:version|v|>=|=|:)?\s*(\d+(?:\.\d+){0,2}(?:\+)?)\b/i;
-  return markdown.match(pattern)?.[1] ?? null;
+  const name = runtime === "node" ? /\bNode(?:\.js)?\b/i : /\bPython\b/i;
+  const token = /(?:>=|<=|>|<|\^|~=|~|==|=)?\s*v?\d+(?:\.(?:\d+|x|\*)){0,2}\+?/gi;
+
+  for (const line of markdown.split("\n")) {
+    const runtimeMatch = name.exec(line);
+    if (!runtimeMatch) continue;
+    const tail = line.slice(runtimeMatch.index + runtimeMatch[0].length);
+    const matches = [...tail.matchAll(token)].map((match) => match[0].trim()).filter(Boolean);
+    if (!matches.length) continue;
+
+    let requirement = matches.join(" ").replace(/\s+/g, " ");
+    if (/\+$/.test(requirement) || /\b(?:or\s+(?:newer|later)|and\s+(?:newer|later))\b/i.test(tail)) {
+      requirement = `>=${requirement.replace(/\+$/, "").replace(/^[=\s]+/, "")}`;
+    }
+    return requirement;
+  }
+  return null;
 }
 
 export function extractReadmePlan(markdown: string): ReadmePlan {
@@ -65,7 +79,7 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
     expectedUrl,
     nodeRequirement: extractRuntime(markdown, "node"),
     pythonRequirement: extractRuntime(markdown, "python"),
-    copiesEnvExample: commands.some((command) => /(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env\b/i.test(command)),
+    copiesEnvExample: commands.some((command) => ENV_COPY.test(command)),
   };
 }
 
@@ -108,7 +122,7 @@ export function isSafeOnboardingCommand(command: string): boolean {
     /^uv\s+(?:sync|run)(?:\s|$)/,
     /^uvicorn(?:\s|$)/,
     /^flask\s+run(?:\s|$)/,
-    /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\s|$)/i,
+    ENV_COPY,
     /^(?:mkdir|touch)\s+/,
   ];
   return allowed.some((pattern) => pattern.test(normalized));
