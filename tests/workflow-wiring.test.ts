@@ -6,11 +6,15 @@ function source(path: string): string {
   return readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 }
 
-test("webhook starts a durable workflow instead of using Next.js after", () => {
+test("webhook claims a GitHub delivery before starting a durable workflow", () => {
   const route = source("app/api/github/webhook/route.ts");
   assert.match(route, /from "workflow\/api"/);
-  assert.match(route, /start\(diagnosePullRequestWorkflow/);
   assert.match(route, /x-github-delivery/);
+  assert.match(route, /claimGitHubDelivery/);
+  assert.match(route, /releaseGitHubDeliveryClaim/);
+  assert.match(route, /claimGitHubDelivery\([\s\S]*start\(diagnosePullRequestWorkflow/);
+  assert.match(route, /deliveryClaimToken: claimed\.claim\.token/);
+  assert.match(route, /if \(!claimed\.claimed\)[\s\S]*status: 202/);
   assert.doesNotMatch(route, /\bafter\s*\(/);
   assert.doesNotMatch(route, /maxDuration/);
 });
@@ -21,10 +25,13 @@ test("Next.js config enables Workflow SDK transformation", () => {
   assert.match(config, /export default withWorkflow\(nextConfig\)/);
 });
 
-test("diagnosis workflow keeps Node-only work inside a step", () => {
+test("workflow confirms delivery ownership before diagnosis work", () => {
   const workflow = source("workflows/diagnose-pull-request.ts");
   assert.match(workflow, /"use workflow"/);
   assert.match(workflow, /"use step"/);
+  assert.match(workflow, /confirmGitHubDeliveryClaim/);
+  assert.match(workflow, /await confirmDeliveryStartStep\([\s\S]*await runDiagnosisStep\(/);
+  assert.match(workflow, /if \(!ownsDelivery\)[\s\S]*status: "duplicate"/);
   assert.match(workflow, /await import\("\.\.\/lib\/orchestrator\/diagnose-pr"\)/);
 });
 
