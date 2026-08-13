@@ -6,6 +6,7 @@ export type FindingCode =
   | "RUNTIME_UNDOCUMENTED"
   | "RUNTIME_MISMATCH"
   | "RUNNER_RUNTIME_UNSUPPORTED"
+  | "RUNNER_TIMEOUT"
   | "PORT_MISMATCH"
   | "START_URL_UNDOCUMENTED"
   | "DOC_STALE";
@@ -50,6 +51,7 @@ export interface CommandObservation {
   exitCode: number;
   stdout: string;
   stderr: string;
+  timedOut: boolean;
 }
 
 export interface ExecutionObservation {
@@ -59,5 +61,6 @@ export interface ExecutionObservation {
   observedPort: number | null;
   observedUrl: string | null;
   httpStatus: number | null;
+  startupTimedOut: boolean;
   runtimeIssue: string | null;
 }
