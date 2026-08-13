@@ -1,7 +1,12 @@
 import { Sandbox } from "@vercel/sandbox";
 import { parseEnvScanOutput } from "../analyzer/env-scan";
 import { isSafeOnboardingCommand } from "../analyzer/readme";
-import { selectNodeSandboxRuntime, supportsPython313 } from "../analyzer/runtime";
+import {
+  nodeReadmeRequirementFitsRepo,
+  pythonReadmeRequirementFitsRepo,
+  selectNodeSandboxRuntime,
+  supportsPython313,
+} from "../analyzer/runtime";
 import type { CommandObservation, ExecutionObservation, ReadmePlan, RepoFacts } from "../analyzer/types";
 
 const REPO_DIR = "/vercel/sandbox/repo";
@@ -42,6 +47,49 @@ function chooseRuntime(facts: RepoFacts): { runtime: SandboxRuntime | null; issu
     };
   }
   return { runtime, issue: null };
+}
+
+function extractExactVersion(output: string): string | null {
+  return output.match(/\bv?(\d+\.\d+\.\d+)\b/i)?.[1] ?? null;
+}
+
+async function readActualRuntimeVersion(sandbox: Sandbox, runtime: SandboxRuntime): Promise<string | null> {
+  const commands = runtime === "python3.13"
+    ? [{ cmd: "python3", args: ["--version"] }, { cmd: "python", args: ["--version"] }]
+    : [{ cmd: "node", args: ["--version"] }];
+
+  for (const command of commands) {
+    const result = await sandbox.runCommand({ cmd: command.cmd, args: command.args });
+    if (result.exitCode !== 0) continue;
+    const output = `${await result.stdout()}\n${await result.stderr()}`;
+    const version = extractExactVersion(output);
+    if (version) return version;
+  }
+  return null;
+}
+
+async function verifyActualRuntime(
+  sandbox: Sandbox,
+  runtime: SandboxRuntime,
+  facts: RepoFacts,
+): Promise<string | null> {
+  const actualVersion = await readActualRuntimeVersion(sandbox, runtime);
+  const runtimeName = runtime === "python3.13" ? "Python" : "Node.js";
+  const requirement = runtime === "python3.13" ? facts.pythonRequirement : facts.nodeRequirement;
+
+  if (!actualVersion) {
+    return `ROD selected ${runtime}, but could not determine its exact ${runtimeName} version before running repository code.`;
+  }
+
+  const satisfies = runtime === "python3.13"
+    ? pythonReadmeRequirementFitsRepo(requirement, actualVersion)
+    : nodeReadmeRequirementFitsRepo(requirement, actualVersion);
+
+  if (satisfies === true) return null;
+  if (satisfies === null) {
+    return `ROD could not safely evaluate repository ${runtimeName} requirement ${requirement ?? "(none)"} against the actual Sandbox version ${actualVersion}.`;
+  }
+  return `Repository requires ${runtimeName} ${requirement ?? "an unsupported version"}, but the selected ROD Sandbox currently provides ${runtimeName} ${actualVersion}. Setup and start were skipped.`;
 }
 
 async function runShell(sandbox: Sandbox, command: string, timeoutSeconds: number): Promise<CommandObservation> {
@@ -199,7 +247,7 @@ export async function runSandboxDiagnosis(
     ...(plan.expectedPort && plan.expectedPort > 0 && plan.expectedPort <= 65535 ? [plan.expectedPort] : []),
   ])];
 
-  // An unsupported project runtime still gets a static env scan, but no repository setup/start command is executed.
+  // Major runtime selection is only a candidate. The exact Sandbox version is verified below before repository code runs.
   const sandbox = await Sandbox.create({
     runtime: selection.runtime ?? "node24",
     timeout: SANDBOX_TIMEOUT_MS,
@@ -211,6 +259,10 @@ export async function runSandboxDiagnosis(
   });
 
   try {
+    const actualRuntimeIssue = selection.runtime
+      ? await verifyActualRuntime(sandbox, selection.runtime, facts)
+      : selection.issue;
+
     await sandbox.writeFiles([{ path: ARCHIVE_PATH, content: archive, mode: 0o600 }]);
     const extract = await sandbox.runCommand({
       cmd: "timeout",
@@ -221,8 +273,8 @@ export async function runSandboxDiagnosis(
     }
 
     const requiredEnv = await detectRequiredEnv(sandbox);
-    if (!selection.runtime) {
-      return { requiredEnv, execution: emptyExecution(selection.issue) };
+    if (actualRuntimeIssue) {
+      return { requiredEnv, execution: emptyExecution(actualRuntimeIssue) };
     }
 
     await runReadmePreparation(sandbox, plan);
