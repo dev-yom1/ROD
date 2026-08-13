@@ -11,21 +11,32 @@ export interface RepositorySnapshotMetadata {
   lockfiles: string[];
 }
 
-async function readTextFile(octokit: Octokit, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+function textResponse(data: unknown, path: string): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  throw new Error(`GitHub raw file read returned an unexpected response for ${path}`);
+}
+
+async function readTextFile(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | null> {
   try {
     const response = await octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
       owner,
       repo,
       path,
       ref,
+      headers: {
+        accept: "application/vnd.github.raw+json",
+      },
     });
-    const data = response.data as { type?: string; content?: string; encoding?: string };
-    if (data.type !== "file" || !data.content) return null;
-    if (data.encoding === "base64") return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
-    return data.content;
+    return textResponse(response.data as unknown, path);
   } catch (error) {
-    const status = (error as { status?: number }).status;
-    if (status === 404) return null;
+    if ((error as { status?: number }).status === 404) return null;
     throw error;
   }
 }
@@ -71,19 +82,16 @@ export async function downloadRepositoryArchive(
   repo: string,
   ref: string,
 ): Promise<Buffer> {
-  const auth = (await octokit.auth()) as { token?: string };
-  if (!auth.token) throw new Error("Could not obtain GitHub installation token for archive download");
-
-  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${encodeURIComponent(ref)}`;
-  const response = await fetch(url, {
+  const response = await octokit.request("GET /repos/{owner}/{repo}/tarball/{ref}", {
+    owner,
+    repo,
+    ref,
     headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${auth.token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "repo-onboarding-doctor",
+      accept: "application/octet-stream",
     },
-    redirect: "follow",
   });
-  if (!response.ok) throw new Error(`GitHub archive download failed: ${response.status} ${response.statusText}`);
-  return Buffer.from(await response.arrayBuffer());
+  const data = response.data as unknown;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  throw new Error("GitHub archive download returned an unexpected response body");
 }
