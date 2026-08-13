@@ -34,10 +34,9 @@ export async function findWorkflowCheckRun(
       app_id: rodAppId,
       per_page: 100,
     },
-    (response) => (response.data as { check_runs: CheckRunSummary[] }).check_runs,
-  );
+  ) as CheckRunSummary[];
 
-  const existing = (checkRuns as CheckRunSummary[]).find(
+  const existing = checkRuns.find(
     (checkRun) => (
       checkRun.external_id === idempotencyKey
       && checkRun.app?.id === rodAppId
