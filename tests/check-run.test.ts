@@ -20,14 +20,17 @@ class FakeOctokit {
   }> = [];
   created = 0;
   paginateArgs: Record<string, unknown> | null = null;
+  paginateMapProvided = false;
   patched: Array<Record<string, unknown>> = [];
 
   async paginate(
     route: string,
     args: Record<string, unknown>,
+    map?: unknown,
   ): Promise<Array<{ id: number; external_id: string; app: { id: number } }>> {
     assert.equal(route, "GET /repos/{owner}/{repo}/commits/{ref}/check-runs");
     this.paginateArgs = { ...args };
+    this.paginateMapProvided = typeof map === "function";
     return this.checkRuns.map((checkRun) => ({ ...checkRun }));
   }
 
@@ -74,7 +77,7 @@ test("reuses the ROD Check Run when the same Workflow step retries", async () =>
   assert.equal(octokit.created, 0);
 });
 
-test("check lookup explicitly requests all pages for the ROD GitHub App", async () => {
+test("check lookup uses Octokit's normalized pagination array", async () => {
   const octokit = new FakeOctokit();
   octokit.checkRuns.push({
     id: 17,
@@ -93,6 +96,7 @@ test("check lookup explicitly requests all pages for the ROD GitHub App", async 
   );
 
   assert.equal(id, 17);
+  assert.equal(octokit.paginateMapProvided, false);
   assert.equal(octokit.paginateArgs?.filter, "all");
   assert.equal(octokit.paginateArgs?.app_id, ROD_APP_ID);
   assert.equal(octokit.paginateArgs?.per_page, 100);
