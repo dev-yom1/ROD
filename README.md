@@ -33,14 +33,17 @@ Vercel Sandbox (no GitHub token)
   ├─ scan env references
   ├─ install dependencies
   ├─ start app
-  └─ observe listening port + HTTP endpoint
+  └─ poll listeners until an HTTP endpoint responds
         │
         ▼
 Finding engine
         │
+        ├─ verify PR head SHA is still current
         ├─ update one PR comment
         └─ complete Check Run
 ```
+
+The reported startup port is the port that actually answered the HTTP probe, not merely the first listening socket. ROD accepts HTTP 2xx–4xx as reachable; persistent 5xx responses are reported as startup failures.
 
 ## Security model
 
@@ -51,10 +54,12 @@ Repository code is untrusted. ROD therefore:
 3. downloads the repository archive before creating the execution environment;
 4. passes only `CI=1` and `ROD_SANDBOX=1` into the Sandbox;
 5. executes only a narrow allowlist of onboarding commands from README examples;
-6. blocks obvious deploy/publish/cloud/remote-shell commands;
-7. always stops the Sandbox in a `finally` block.
+6. restricts `.env.example` copies to root `.env`, `.env.local`, or `.env.development.local` destinations;
+7. blocks obvious deploy/publish/cloud/remote-shell commands;
+8. limits the Sandbox to 240 seconds and applies shorter command deadlines;
+9. always stops the Sandbox in a `finally` block.
 
-The command policy is intentionally conservative. Commands ROD will not safely reproduce should become explicit findings in a later release instead of being executed blindly.
+The command policy is intentionally conservative. Commands ROD will not safely reproduce should become explicit findings instead of being executed blindly.
 
 ## GitHub App configuration
 
@@ -72,6 +77,8 @@ https://YOUR_DEPLOYMENT/api/github/webhook
 ```
 
 ROD reacts to `opened`, `reopened`, `synchronize`, and `ready_for_review` actions.
+
+Each diagnosis is tied to the webhook's PR head SHA. Immediately before writing the reusable PR report, ROD re-fetches the pull request head. If the SHA changed, the old Check Run is marked superseded and the PR report is left untouched. Same-head first-run comment races are also deduplicated back to one marker comment. Reports include the diagnosed short SHA for incident tracing.
 
 ## Environment variables
 
@@ -110,8 +117,9 @@ npm run build
 
 ## Current MVP limits
 
-- Runtime execution uses Vercel Sandbox built-in Node 22/24/26 or Python 3.13 environments.
+- Node execution is limited to Vercel Sandbox Node 22/24/26. ROD evaluates version ranges and skips repository execution when none of those runtime lines overlap the repository constraint, reporting `RUNNER_RUNTIME_UNSUPPORTED` instead of blaming the repository.
+- Python execution currently uses Python 3.13. PEP 440-style constraints are checked before execution; incompatible requirements are skipped as a runner limitation.
 - It does not provision databases or third-party services for the target repository.
 - Environment-variable detection is static and intentionally biased toward common Node.js and Python patterns.
 - “Stale explanation” detection currently covers concrete script/runtime/port contradictions; semantic prose drift is reserved for the AI-assisted analyzer phase.
-- Long diagnoses currently run from Next.js `after()`. Moving orchestration to Vercel Workflow is the next reliability milestone before high-volume production use.
+- Diagnoses currently run from Next.js `after()`. The Sandbox lifetime is capped below the Route's 300-second maximum, but moving orchestration to a durable workflow is still the next reliability milestone before high-volume production use.
