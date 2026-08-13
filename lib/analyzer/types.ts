@@ -5,6 +5,7 @@ export type FindingCode =
   | "COMMAND_BROKEN"
   | "RUNTIME_UNDOCUMENTED"
   | "RUNTIME_MISMATCH"
+  | "RUNNER_RUNTIME_UNSUPPORTED"
   | "PORT_MISMATCH"
   | "START_URL_UNDOCUMENTED"
   | "DOC_STALE";
@@ -55,7 +56,8 @@ export interface ExecutionObservation {
   install: CommandObservation | null;
   startCommand: string | null;
   startLog: string;
-  observedPorts: number[];
+  observedPort: number | null;
   observedUrl: string | null;
   httpStatus: number | null;
+  runtimeIssue: string | null;
 }
