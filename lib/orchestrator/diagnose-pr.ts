@@ -3,7 +3,14 @@ import { diagnose } from "../analyzer/diagnose";
 import { extractReadmePlan } from "../analyzer/readme";
 import { getInstallationOctokit } from "../github/client";
 import { downloadRepositoryArchive, fetchRepositoryMetadata } from "../github/repository";
-import { completeCheckRun, createCheckRun, failCheckRun, renderReport, upsertPullRequestReport } from "../github/reporter";
+import {
+  completeCheckRun,
+  createCheckRun,
+  failCheckRun,
+  obsoleteCheckRun,
+  renderReport,
+  upsertPullRequestReport,
+} from "../github/reporter";
 import { runSandboxDiagnosis } from "../runner/sandbox";
 
 export interface DiagnosePullRequestInput {
@@ -53,9 +60,26 @@ export async function diagnosePullRequest(input: DiagnosePullRequestInput): Prom
       requiredEnv: sandboxResult.requiredEnv,
     });
     const findings = diagnose(metadata.readme, plan, facts, sandboxResult.execution);
-    const report = renderReport(findings, sandboxResult.execution.observedUrl);
+    const report = renderReport(
+      findings,
+      sandboxResult.execution.observedUrl,
+      input.headSha,
+      sandboxResult.execution.httpStatus,
+    );
 
-    await upsertPullRequestReport(octokit, base.owner, base.repo, input.pullNumber, report);
+    const publication = await upsertPullRequestReport(
+      octokit,
+      base.owner,
+      base.repo,
+      input.pullNumber,
+      input.headSha,
+      report,
+    );
+    if (!publication.updated) {
+      await obsoleteCheckRun(octokit, base.owner, base.repo, checkRunId, publication.currentHeadSha);
+      return;
+    }
+
     await completeCheckRun(octokit, base.owner, base.repo, checkRunId, findings);
   } catch (error) {
     if (checkRunId !== null) {
