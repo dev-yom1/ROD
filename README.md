@@ -22,11 +22,13 @@ GitHub pull_request webhook
         ▼
 Next.js route handler
   ├─ verify HMAC signature
-  ├─ capture X-GitHub-Delivery for tracing
+  ├─ atomically claim X-GitHub-Delivery in durable Redis
+  ├─ duplicate delivery → return 202 without starting another run
   └─ start Workflow run → return 202 + runId
         │
         ▼
 Workflow SDK
+  ├─ durably confirm this run still owns the delivery claim
   └─ durable diagnosis step
         │
         ├─ verify PR head SHA
@@ -53,7 +55,7 @@ Finding engine
   └─ complete Check Run
 ```
 
-Workflow functions only coordinate durable execution. GitHub, Sandbox, crypto, and other Node.js work runs inside a `"use step"` function.
+Workflow functions only coordinate durable execution. GitHub, Sandbox, crypto, Redis delivery-claim I/O, and other Node.js work runs inside route or `"use step"` contexts.
 
 ## Durable execution
 
@@ -63,7 +65,15 @@ A run can become obsolete when a newer `synchronize` event arrives. ROD checks t
 
 Workflow steps retry unhandled failures. Check Runs therefore use the Workflow run ID as their retry identity: retries inside the same Workflow run reuse the same ROD-owned Check Run, while a separate Workflow run cannot overwrite that run's Check status. Check lookup explicitly requests `filter=all`, scopes to the ROD GitHub App, and paginates results so an older Check is not lost behind GitHub's default latest-only filter. A final failure is written only after the diagnosis step has exhausted its retries.
 
-The webhook also requires and carries `X-GitHub-Delivery` through Workflow logs for incident tracing. **This is not yet a persistent delivery claim.** A redelivery of the same GitHub delivery can still start another Workflow run. Durable atomic delivery deduplication is tracked in issue #3 and requires a persistent create-if-absent store before `start()`.
+### Webhook delivery idempotency
+
+ROD uses `X-GitHub-Delivery` as a durable request key before calling `start()`. The route issues Redis `SET key value EX <pending-ttl> NX`; concurrent or redelivered requests that do not win the atomic create return HTTP 202 without creating another Workflow run.
+
+A newly claimed delivery starts as a short pending lease. The Workflow's first durable step compares the pending claim token and atomically promotes only the owning run to a confirmed claim containing its Workflow run ID. Confirmed claims live for seven days by default. Both promotion and cleanup use compare-and-set Lua scripts, so one request cannot overwrite or release another request's claim.
+
+If `start()` throws, the route attempts to release only its own still-pending claim. If the Workflow was actually accepted despite an ambiguous response and confirms ownership first, the release CAS fails harmlessly and that run remains the owner. If the route releases first and a retry acquires the delivery, the older run cannot confirm the new claim and exits before diagnosis/Sandbox work.
+
+The claim store uses the Upstash Redis REST API so it can run from serverless route and Workflow step contexts without a persistent TCP connection. Provision/connect a durable Redis resource through Vercel Marketplace (or provide compatible Upstash REST credentials) and expose the environment variables listed below.
 
 Useful local inspection commands:
 
@@ -106,15 +116,16 @@ Install timeout is also reported as `RUNNER_TIMEOUT`, not `INSTALL_BROKEN`.
 Repository code is untrusted. ROD therefore:
 
 1. verifies every GitHub webhook with `X-Hub-Signature-256`;
-2. uses GitHub installation credentials only in the control plane and never forwards them into repository code;
-3. verifies the exact Sandbox runtime before repository commands execute;
-4. runs only a narrow allowlist of onboarding commands;
-5. restricts `.env.example` copies to root `.env`, `.env.local`, or `.env.development.local` destinations;
-6. blocks obvious deploy/publish/cloud/remote-shell commands;
-7. limits Sandbox and command execution budgets;
-8. identifies reusable reports by both a hidden ROD marker and `performed_via_github_app.id === GITHUB_APP_ID`;
-9. wraps untrusted stdout/stderr in a Markdown fence longer than any backtick run in the log;
-10. always stops the Sandbox in a `finally` block.
+2. atomically deduplicates authenticated delivery GUIDs in a durable external store before starting expensive work;
+3. uses GitHub installation credentials only in the control plane and never forwards them into repository code;
+4. verifies the exact Sandbox runtime before repository commands execute;
+5. runs only a narrow allowlist of onboarding commands;
+6. restricts `.env.example` copies to root `.env`, `.env.local`, or `.env.development.local` destinations;
+7. blocks obvious deploy/publish/cloud/remote-shell commands;
+8. limits Sandbox and command execution budgets;
+9. identifies reusable reports by both a hidden ROD marker and `performed_via_github_app.id === GITHUB_APP_ID`;
+10. wraps untrusted stdout/stderr in a Markdown fence longer than any backtick run in the log;
+11. always stops the Sandbox in a `finally` block.
 
 ## GitHub App configuration
 
@@ -144,8 +155,19 @@ Required:
 - `GITHUB_APP_ID`
 - `GITHUB_PRIVATE_KEY`
 - `GITHUB_WEBHOOK_SECRET`
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
 
 `GITHUB_APP_ID` must be the positive numeric ID of the ROD GitHub App. It is also used to authenticate ownership of reusable report comments.
+
+`UPSTASH_REDIS_REST_URL` must be HTTPS. `UPSTASH_REDIS_REST_TOKEN` needs write access because ROD uses `SET`, `EVAL`, and `DEL` for delivery claims. The standard token must remain server-side.
+
+Optional delivery-claim tuning:
+
+- `ROD_DELIVERY_PENDING_TTL_SECONDS` — short pre-confirmation lease, default `120`
+- `ROD_DELIVERY_CLAIM_TTL_SECONDS` — confirmed retention, default `604800` (7 days)
+
+The confirmed TTL must be greater than the pending TTL.
 
 Vercel Sandbox and Workflow use the deployment's Vercel integration/runtime configuration. Local Sandbox development can additionally use `VERCEL_TOKEN`, `VERCEL_TEAM_ID`, and `VERCEL_PROJECT_ID` where needed.
 
@@ -179,4 +201,4 @@ The Workflow TypeScript plugin is enabled alongside the Next.js plugin in `tscon
 - Environment-variable detection is static and intentionally focused on common Node.js and Python patterns.
 - Semantic prose drift is not AI-assisted yet.
 - Durable execution prevents request-lifetime failures and stale runs are suppressed, but active in-flight Sandbox cancellation on a newer SHA is still a later optimization.
-- GitHub delivery GUIDs are traced but are not yet atomically claimed; issue #3 tracks persistent webhook-delivery idempotency.
+- Webhook delivery idempotency depends on the configured durable Redis REST store; confirmed claims expire after the configured retention window.
