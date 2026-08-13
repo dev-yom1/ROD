@@ -1,45 +1,66 @@
 import { npmScriptReferencedByCommand } from "./readme";
+import { nodeRequirementsOverlap, pythonRequirementsOverlap } from "./runtime";
 import type { ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
-
-function major(version: string | null): number | null {
-  if (!version) return null;
-  const match = version.match(/\d+/);
-  return match ? Number(match[0]) : null;
-}
 
 function excerpt(text: string, max = 500): string {
   const normalized = text.trim();
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}…`;
 }
 
-export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run: ExecutionObservation): Finding[] {
-  const findings: Finding[] = [];
-
-  if (facts.nodeRequirement && !plan.nodeRequirement) {
+function pushRuntimeFinding(
+  findings: Finding[],
+  runtime: "Node.js" | "Python",
+  repoRequirement: string | null,
+  readmeRequirement: string | null,
+  overlaps: boolean | null,
+): void {
+  if (repoRequirement && !readmeRequirement) {
     findings.push({
       code: "RUNTIME_UNDOCUMENTED",
       severity: "warning",
-      title: "Node.js version is not documented",
-      detail: `The repository declares Node.js ${facts.nodeRequirement}, but the README does not state a Node.js version.`,
-      suggestion: `Add a Requirements section that names Node.js ${facts.nodeRequirement}.`,
+      title: `${runtime} version is not documented`,
+      detail: `The repository declares ${runtime} ${repoRequirement}, but the README does not state a ${runtime} version.`,
+      suggestion: `Add ${runtime} ${repoRequirement} to the prerequisites.`,
     });
-  } else if (facts.nodeRequirement && plan.nodeRequirement && major(facts.nodeRequirement) !== major(plan.nodeRequirement)) {
+    return;
+  }
+
+  if (repoRequirement && readmeRequirement && overlaps === false) {
     findings.push({
       code: "RUNTIME_MISMATCH",
       severity: "warning",
-      title: "README Node.js version disagrees with the repository",
-      detail: `README mentions Node.js ${plan.nodeRequirement}, while repository configuration indicates ${facts.nodeRequirement}.`,
-      suggestion: `Update the README to match ${facts.nodeRequirement}, or change the repository runtime configuration.`,
+      title: `README ${runtime} version disagrees with the repository`,
+      detail: `README mentions ${runtime} ${readmeRequirement}, while repository configuration indicates ${repoRequirement}. These ranges do not overlap.`,
+      suggestion: `Update the README to match ${repoRequirement}, or change the repository runtime configuration.`,
     });
   }
+}
 
-  if (facts.pythonRequirement && !plan.pythonRequirement) {
+export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run: ExecutionObservation): Finding[] {
+  const findings: Finding[] = [];
+
+  pushRuntimeFinding(
+    findings,
+    "Node.js",
+    facts.nodeRequirement,
+    plan.nodeRequirement,
+    nodeRequirementsOverlap(facts.nodeRequirement, plan.nodeRequirement),
+  );
+  pushRuntimeFinding(
+    findings,
+    "Python",
+    facts.pythonRequirement,
+    plan.pythonRequirement,
+    pythonRequirementsOverlap(facts.pythonRequirement, plan.pythonRequirement),
+  );
+
+  if (run.runtimeIssue) {
     findings.push({
-      code: "RUNTIME_UNDOCUMENTED",
+      code: "RUNNER_RUNTIME_UNSUPPORTED",
       severity: "warning",
-      title: "Python version is not documented",
-      detail: `The repository declares Python ${facts.pythonRequirement}, but the README does not state a Python version.`,
-      suggestion: `Add Python ${facts.pythonRequirement} to the prerequisites.`,
+      title: "ROD cannot reproduce this runtime requirement yet",
+      detail: run.runtimeIssue,
+      suggestion: "Treat this as a ROD runner limitation, not a repository setup failure.",
     });
   }
 
@@ -92,26 +113,29 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     });
   }
 
-  if (run.startCommand && run.install?.exitCode !== 0) {
+  if (!run.runtimeIssue && run.startCommand && run.install && run.install.exitCode !== 0) {
     // Avoid duplicating a startup failure when install already failed.
-  } else if (run.startCommand && run.observedPorts.length === 0) {
+  } else if (!run.runtimeIssue && run.startCommand && (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500)) {
+    const responseDetail = run.httpStatus === null
+      ? "No HTTP response was received from any observed application listener."
+      : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
     findings.push({
       code: "COMMAND_BROKEN",
       severity: "error",
       title: "Development server did not become reachable",
-      detail: `ROD started \`${run.startCommand}\` but did not observe a listening application port.`,
+      detail: `ROD started \`${run.startCommand}\`, but a usable HTTP endpoint was not observed. ${responseDetail}`,
       evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
       suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
     });
   }
 
-  const observedPort = run.observedPorts[0] ?? null;
+  const observedPort = run.observedPort;
   if (observedPort && plan.expectedPort && observedPort !== plan.expectedPort) {
     findings.push({
       code: "PORT_MISMATCH",
       severity: "warning",
       title: "README port does not match the running app",
-      detail: `README points to port ${plan.expectedPort}, but the fresh environment listened on port ${observedPort}.`,
+      detail: `README points to port ${plan.expectedPort}, but the HTTP endpoint ROD reached was on port ${observedPort}.`,
       suggestion: `Change the README URL to use port ${observedPort}, or configure the app to use ${plan.expectedPort}.`,
     });
   } else if (observedPort && !plan.expectedPort) {
@@ -119,7 +143,7 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       code: "START_URL_UNDOCUMENTED",
       severity: "info",
       title: "Startup URL is not documented",
-      detail: `The app listened on port ${observedPort}, but README does not provide a localhost URL with a port.`,
+      detail: `ROD reached the app on port ${observedPort}, but README does not provide a localhost URL with a port.`,
       suggestion: `Add a line such as \`http://localhost:${observedPort}\` after the start command.`,
     });
   }
