@@ -1,0 +1,33 @@
+{
+  "name": "rod",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Repo Onboarding Doctor",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "workflow:inspect": "workflow inspect runs",
+    "workflow:web": "workflow web"
+  },
+  "dependencies": {
+    "@vercel/sandbox": "^1.10.2",
+    "next": "^16.0.0",
+    "octokit": "^5.0.5",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "workflow": "^4.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
