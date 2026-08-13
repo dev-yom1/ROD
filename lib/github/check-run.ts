@@ -8,20 +8,21 @@ interface CheckRunSummary {
   app?: { id: number } | null;
 }
 
-function externalId(pullNumber: number, headSha: string): string {
-  return `rod:pr:${pullNumber}:sha:${headSha}`;
+function externalId(workflowRunId: string, pullNumber: number): string {
+  return `rod:workflow:${workflowRunId}:pr:${pullNumber}`;
 }
 
-export async function ensureCheckRun(
+export async function findWorkflowCheckRun(
   octokit: Octokit,
   owner: string,
   repo: string,
   pullNumber: number,
   headSha: string,
   rodAppId: number,
-): Promise<number> {
-  const idempotencyKey = externalId(pullNumber, headSha);
-  const existingResponse = await octokit.request(
+  workflowRunId: string,
+): Promise<number | null> {
+  const idempotencyKey = externalId(workflowRunId, pullNumber);
+  const response = await octokit.request(
     "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
     {
       owner,
@@ -32,28 +33,47 @@ export async function ensureCheckRun(
     },
   );
 
-  const existing = (existingResponse.data as { check_runs: CheckRunSummary[] }).check_runs.find(
+  const existing = (response.data as { check_runs: CheckRunSummary[] }).check_runs.find(
     (checkRun) => (
       checkRun.external_id === idempotencyKey
       && checkRun.app?.id === rodAppId
     ),
   );
 
-  if (existing) {
-    return existing.id;
-  }
+  return existing?.id ?? null;
+}
+
+export async function ensureCheckRun(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  headSha: string,
+  rodAppId: number,
+  workflowRunId: string,
+): Promise<number> {
+  const existingId = await findWorkflowCheckRun(
+    octokit,
+    owner,
+    repo,
+    pullNumber,
+    headSha,
+    rodAppId,
+    workflowRunId,
+  );
+  if (existingId !== null) return existingId;
 
   const response = await octokit.request("POST /repos/{owner}/{repo}/check-runs", {
     owner,
     repo,
     name: CHECK_NAME,
     head_sha: headSha,
-    external_id: idempotencyKey,
+    external_id: externalId(workflowRunId, pullNumber),
     status: "in_progress",
     started_at: new Date().toISOString(),
     output: {
       title: "ROD is reproducing README onboarding",
-      summary: `Running setup from a fresh isolated environment for ${headSha.slice(0, 12)}.`,
+      summary: `Workflow ${workflowRunId} is checking ${headSha.slice(0, 12)} in a fresh isolated environment.`,
     },
   });
 
