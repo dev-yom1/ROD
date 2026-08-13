@@ -161,16 +161,29 @@ async function startApplication(sandbox: Sandbox, command: string): Promise<void
   });
 }
 
-async function readListeningPorts(sandbox: Sandbox, exposedPorts: number[]): Promise<number[]> {
-  const portResult = await sandbox.runCommand({
-    cmd: "bash",
-    args: ["-lc", "(ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null || true) | grep -oE ':[0-9]{2,5}' | tr -d ':' | sort -n -u"],
+function orderedProbePorts(exposedPorts: number[], preferredPort: number | null): number[] {
+  return [...new Set([
+    ...(preferredPort && exposedPorts.includes(preferredPort) ? [preferredPort] : []),
+    ...exposedPorts,
+  ])];
+}
+
+async function probeLocalHttpStatus(sandbox: Sandbox, port: number): Promise<number | null> {
+  const script = [
+    `port=${port}`,
+    "exec 3<>/dev/tcp/127.0.0.1/$port || exit 1",
+    "printf 'GET / HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3",
+    "IFS= read -r status_line <&3 || exit 1",
+    "printf '%s' \"$status_line\"",
+  ].join("; ");
+  const result = await sandbox.runCommand({
+    cmd: "timeout",
+    args: ["--signal=TERM", "3s", "bash", "-lc", script],
   });
-  const allowed = new Set(exposedPorts);
-  return String(await portResult.stdout())
-    .split(/\s+/)
-    .map((value: string) => Number(value))
-    .filter((port: number) => Number.isInteger(port) && allowed.has(port));
+  if (result.exitCode !== 0) return null;
+  const statusLine = (await result.stdout()).trim();
+  const match = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/i);
+  return match ? Number(match[1]) : null;
 }
 
 async function probeObservedUrl(
@@ -179,27 +192,31 @@ async function probeObservedUrl(
   preferredPort: number | null,
 ): Promise<{ port: number; url: string; status: number } | null> {
   const deadline = Date.now() + PROBE_TIMEOUT_MS;
+  const orderedPorts = orderedProbePorts(exposedPorts, preferredPort);
   let lastServerError: { port: number; url: string; status: number } | null = null;
   while (Date.now() < deadline) {
-    const listeners = await readListeningPorts(sandbox, exposedPorts);
-    const ordered = [...new Set([
-      ...(preferredPort && listeners.includes(preferredPort) ? [preferredPort] : []),
-      ...listeners,
-    ])];
-
-    for (const port of ordered) {
+    for (const port of orderedPorts) {
       const domain = sandbox.domain(port);
       const url = domain.startsWith("http://") || domain.startsWith("https://") ? domain : `https://${domain}`;
+
+      const localStatus = await probeLocalHttpStatus(sandbox, port);
+      if (localStatus !== null) {
+        const observation = { port, url, status: localStatus };
+        if (localStatus < 500) return observation;
+        lastServerError = observation;
+        continue;
+      }
+
       try {
         const response = await fetch(url, {
           redirect: "manual",
-          signal: AbortSignal.timeout(5_000),
+          signal: AbortSignal.timeout(3_000),
         });
         const observation = { port, url, status: response.status };
         if (response.status < 500) return observation;
         lastServerError = observation;
       } catch {
-        // A listener without an HTTP response is not considered a reachable app.
+        // Public ingress can lag behind process startup; retry until the observation budget expires.
       }
     }
     await sandbox.runCommand("sleep", [String(PROBE_INTERVAL_MS / 1000)]);
