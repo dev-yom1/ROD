@@ -55,6 +55,7 @@ async function runShell(sandbox: Sandbox, command: string, timeoutSeconds: numbe
     exitCode: result.exitCode,
     stdout: await result.stdout(),
     stderr: await result.stderr(),
+    timedOut: result.exitCode === 124,
   };
 }
 
@@ -97,7 +98,7 @@ async function startApplication(sandbox: Sandbox, command: string): Promise<void
   await sandbox.writeFiles([
     {
       path: "/tmp/rod-start.sh",
-      content: Buffer.from(`#!/usr/bin/env bash\nset -o pipefail\ncd ${REPO_DIR}\nexec ${command} > /tmp/rod-start.log 2>&1\n`),
+      content: Buffer.from(`#!/usr/bin/env bash\nset -o pipefail\necho $$ > /tmp/rod-start.pid\ncd ${REPO_DIR}\nexec ${command} > /tmp/rod-start.log 2>&1\n`),
       mode: 0o700,
     },
   ]);
@@ -166,6 +167,14 @@ async function readStartLog(sandbox: Sandbox): Promise<string> {
   return await logResult.stdout();
 }
 
+async function isStartProcessAlive(sandbox: Sandbox): Promise<boolean> {
+  const result = await sandbox.runCommand({
+    cmd: "bash",
+    args: ["-lc", "pid=$(cat /tmp/rod-start.pid 2>/dev/null) && [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null"],
+  });
+  return result.exitCode === 0;
+}
+
 function emptyExecution(runtimeIssue: string | null): ExecutionObservation {
   return {
     install: null,
@@ -174,6 +183,7 @@ function emptyExecution(runtimeIssue: string | null): ExecutionObservation {
     observedPort: null,
     observedUrl: null,
     httpStatus: null,
+    startupTimedOut: false,
     runtimeIssue,
   };
 }
@@ -189,7 +199,7 @@ export async function runSandboxDiagnosis(
     ...(plan.expectedPort && plan.expectedPort > 0 && plan.expectedPort <= 65535 ? [plan.expectedPort] : []),
   ])];
 
-  // Unsupported project runtimes get a static env scan only; repository setup/start commands are skipped.
+  // An unsupported project runtime still gets a static env scan, but no repository setup/start command is executed.
   const sandbox = await Sandbox.create({
     runtime: selection.runtime ?? "node24",
     timeout: SANDBOX_TIMEOUT_MS,
@@ -226,8 +236,9 @@ export async function runSandboxDiagnosis(
     let observedPort: number | null = null;
     let observedUrl: string | null = null;
     let httpStatus: number | null = null;
+    let startupTimedOut = false;
 
-    if (startCommand && (!install || install.exitCode === 0)) {
+    if (startCommand && (!install || (!install.timedOut && install.exitCode === 0))) {
       await startApplication(sandbox, startCommand);
       const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort);
       startLog = await readStartLog(sandbox);
@@ -235,6 +246,8 @@ export async function runSandboxDiagnosis(
         observedPort = probe.port;
         observedUrl = probe.url;
         httpStatus = probe.status;
+      } else {
+        startupTimedOut = await isStartProcessAlive(sandbox);
       }
     }
 
@@ -247,6 +260,7 @@ export async function runSandboxDiagnosis(
         observedPort,
         observedUrl,
         httpStatus,
+        startupTimedOut,
         runtimeIssue: null,
       },
     };
