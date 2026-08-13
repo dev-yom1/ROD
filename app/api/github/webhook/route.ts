@@ -4,6 +4,7 @@ import { verifyGitHubSignature } from "../../../../lib/github/signature";
 import { diagnosePullRequest } from "../../../../lib/orchestrator/diagnose-pr";
 
 export const runtime = "nodejs";
+// Keep the Route lifetime above the runner's 240s Sandbox cap so reporting has cleanup headroom.
 export const maxDuration = 300;
 
 interface PullRequestWebhook {
