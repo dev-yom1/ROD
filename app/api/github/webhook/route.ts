@@ -1,11 +1,9 @@
-import { after } from "next/server";
+import { start } from "workflow/api";
 import { githubConfig } from "../../../../lib/config";
 import { verifyGitHubSignature } from "../../../../lib/github/signature";
-import { diagnosePullRequest } from "../../../../lib/orchestrator/diagnose-pr";
+import { diagnosePullRequestWorkflow } from "../../../../workflows/diagnose-pull-request";
 
 export const runtime = "nodejs";
-// Keep the Route lifetime above the runner's 240s Sandbox cap so reporting has cleanup headroom.
-export const maxDuration = 300;
 
 interface PullRequestWebhook {
   action?: string;
@@ -31,11 +29,16 @@ export async function POST(request: Request): Promise<Response> {
 
   const event = request.headers.get("x-github-event");
   if (event === "ping") return Response.json({ ok: true, event: "ping" });
-  if (event !== "pull_request") return Response.json({ ok: true, ignored: event ?? "unknown" }, { status: 202 });
+  if (event !== "pull_request") {
+    return Response.json({ ok: true, ignored: event ?? "unknown" }, { status: 202 });
+  }
 
   const payload = JSON.parse(rawBody) as PullRequestWebhook;
   if (!payload.action || !SUPPORTED_ACTIONS.has(payload.action)) {
-    return Response.json({ ok: true, ignored: payload.action ?? "unknown-action" }, { status: 202 });
+    return Response.json(
+      { ok: true, ignored: payload.action ?? "unknown-action" },
+      { status: 202 },
+    );
   }
 
   const installationId = payload.installation?.id;
@@ -44,16 +47,26 @@ export async function POST(request: Request): Promise<Response> {
   const pullNumber = payload.pull_request?.number;
   const headSha = payload.pull_request?.head?.sha;
   if (!installationId || !baseRepository || !sourceRepository || !pullNumber || !headSha) {
-    return Response.json({ ok: false, error: "incomplete pull_request payload" }, { status: 400 });
+    return Response.json(
+      { ok: false, error: "incomplete pull_request payload" },
+      { status: 400 },
+    );
   }
 
-  after(async () => {
-    try {
-      await diagnosePullRequest({ installationId, baseRepository, sourceRepository, pullNumber, headSha });
-    } catch (error) {
-      console.error("ROD diagnosis failed", error);
-    }
-  });
+  const run = await start(diagnosePullRequestWorkflow, [{
+    installationId,
+    baseRepository,
+    sourceRepository,
+    pullNumber,
+    headSha,
+  }]);
 
-  return Response.json({ ok: true, accepted: true }, { status: 202 });
+  console.log(
+    `[ROD webhook] started workflow run=${run.runId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
+  );
+
+  return Response.json(
+    { ok: true, accepted: true, runId: run.runId },
+    { status: 202 },
+  );
 }
