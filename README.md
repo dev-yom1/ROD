@@ -94,10 +94,10 @@ README range ⊆ repository range
 Examples:
 
 ```text
-repo >=22, README >=20  -> mismatch
-repo >=22, README >=22  -> ok
-repo >=22, README 22    -> ok
-repo >=3.12, README >=3.10 -> mismatch
+repo >=22, README >=20      -> mismatch
+repo >=22, README >=22      -> ok
+repo >=22, README 22        -> ok
+repo >=3.12, README >=3.10  -> mismatch
 ```
 
 This avoids accepting documentation that is merely *partially* compatible with the repository.
