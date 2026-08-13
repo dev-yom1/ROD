@@ -5,6 +5,7 @@ import { ensureCheckRun } from "../lib/github/check-run";
 
 const SHA = "a".repeat(40);
 const ROD_APP_ID = 42;
+const RUN_ID = "wrun_test_123";
 
 class FakeOctokit {
   checkRuns: Array<{
@@ -34,11 +35,11 @@ class FakeOctokit {
   }
 }
 
-test("reuses the ROD Check Run for the same PR and SHA", async () => {
+test("reuses the ROD Check Run when the same Workflow step retries", async () => {
   const octokit = new FakeOctokit();
   octokit.checkRuns.push({
     id: 7,
-    external_id: `rod:pr:3:sha:${SHA}`,
+    external_id: `rod:workflow:${RUN_ID}:pr:3`,
     app: { id: ROD_APP_ID },
   });
 
@@ -49,17 +50,40 @@ test("reuses the ROD Check Run for the same PR and SHA", async () => {
     3,
     SHA,
     ROD_APP_ID,
+    RUN_ID,
   );
 
   assert.equal(id, 7);
   assert.equal(octokit.created, 0);
 });
 
-test("does not reuse a Check Run created by another GitHub App", async () => {
+test("a separate Workflow run does not share the previous run's Check Run", async () => {
   const octokit = new FakeOctokit();
   octokit.checkRuns.push({
     id: 8,
-    external_id: `rod:pr:3:sha:${SHA}`,
+    external_id: `rod:workflow:${RUN_ID}:pr:3`,
+    app: { id: ROD_APP_ID },
+  });
+
+  const id = await ensureCheckRun(
+    octokit as unknown as Octokit,
+    "owner",
+    "repo",
+    3,
+    SHA,
+    ROD_APP_ID,
+    "wrun_other_456",
+  );
+
+  assert.equal(id, 101);
+  assert.equal(octokit.created, 1);
+});
+
+test("does not reuse a Check Run created by another GitHub App", async () => {
+  const octokit = new FakeOctokit();
+  octokit.checkRuns.push({
+    id: 9,
+    external_id: `rod:workflow:${RUN_ID}:pr:3`,
     app: { id: 999 },
   });
 
@@ -70,6 +94,7 @@ test("does not reuse a Check Run created by another GitHub App", async () => {
     3,
     SHA,
     ROD_APP_ID,
+    RUN_ID,
   );
 
   assert.equal(id, 101);
