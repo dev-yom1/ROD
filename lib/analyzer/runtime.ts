@@ -1,8 +1,6 @@
 type Version = readonly [major: number, minor: number, patch: number];
-
 type Bound = { version: Version; inclusive: boolean };
 type Interval = { min?: Bound; max?: Bound };
-
 type RuntimeKind = "node" | "python";
 
 const NODE_SANDBOX_MAJORS = [22, 24, 26] as const;
@@ -78,10 +76,7 @@ function partialInterval(parsed: NonNullable<ReturnType<typeof parseVersion>>): 
   const { version, parts, wildcardIndex } = parsed;
   const effectiveParts = wildcardIndex ?? parts;
   if (effectiveParts >= 3 && wildcardIndex === null) {
-    return {
-      min: { version, inclusive: true },
-      max: { version, inclusive: true },
-    };
+    return { min: { version, inclusive: true }, max: { version, inclusive: true } };
   }
   const bumpIndex = Math.max(0, effectiveParts - 1) as 0 | 1 | 2;
   return {
@@ -125,11 +120,7 @@ function comparatorInterval(token: string, kind: RuntimeKind): Interval | null {
 }
 
 function normalizeRequirement(requirement: string): string {
-  return requirement
-    .trim()
-    .replace(/\b(?:and)\b/gi, " ")
-    .replace(/,/g, " ")
-    .replace(/\s+/g, " ");
+  return requirement.trim().replace(/\b(?:and)\b/gi, " ").replace(/,/g, " ").replace(/\s+/g, " ");
 }
 
 function parseRange(requirement: string | null, kind: RuntimeKind): Interval[] | null {
@@ -145,27 +136,24 @@ function parseRange(requirement: string | null, kind: RuntimeKind): Interval[] |
       const low = parseVersion(hyphen[1]);
       const high = parseVersion(hyphen[2]);
       if (!low || !high) return null;
-      parsedAlternatives.push({
+      const interval = {
         min: { version: low.version, inclusive: true },
         max: { version: high.version, inclusive: true },
-      });
+      };
+      if (intersect(interval, interval)) parsedAlternatives.push(interval);
       continue;
     }
 
     const tokens = alternative.match(/(?:>=|<=|>|<|\^|~=|~|==|=)?\s*v?\d+(?:\.(?:\d+|x|\*)){0,2}/gi);
     if (!tokens?.length) return null;
-    let current: Interval = {};
+    let current: Interval | null = {};
     for (const token of tokens) {
       const next = comparatorInterval(token.replace(/\s+/g, ""), kind);
       if (!next) return null;
-      const combined = intersect(current, next);
-      if (!combined) {
-        current = { min: { version: [1, 0, 0], inclusive: true }, max: { version: [0, 0, 0], inclusive: true } };
-        break;
-      }
-      current = combined;
+      current = current ? intersect(current, next) : null;
+      if (!current) break;
     }
-    parsedAlternatives.push(current);
+    if (current) parsedAlternatives.push(current);
   }
 
   return parsedAlternatives;
@@ -178,6 +166,72 @@ function rangesOverlap(a: string | null, b: string | null, kind: RuntimeKind): b
   return left.some((x) => right.some((y) => intervalsOverlap(x, y)));
 }
 
+function compareIntervalStart(a: Interval, b: Interval): number {
+  if (!a.min && !b.min) return 0;
+  if (!a.min) return -1;
+  if (!b.min) return 1;
+  const cmp = compareVersion(a.min.version, b.min.version);
+  if (cmp !== 0) return cmp;
+  if (a.min.inclusive === b.min.inclusive) return 0;
+  return a.min.inclusive ? -1 : 1;
+}
+
+function canMerge(a: Interval, b: Interval): boolean {
+  if (!a.max || !b.min) return true;
+  const cmp = compareVersion(a.max.version, b.min.version);
+  if (cmp > 0) return true;
+  if (cmp < 0) return false;
+  return a.max.inclusive || b.min.inclusive;
+}
+
+function laterUpper(a: Bound | undefined, b: Bound | undefined): Bound | undefined {
+  if (!a || !b) return undefined;
+  const cmp = compareVersion(a.version, b.version);
+  if (cmp > 0) return a;
+  if (cmp < 0) return b;
+  return { version: a.version, inclusive: a.inclusive || b.inclusive };
+}
+
+function mergeIntervals(intervals: Interval[]): Interval[] {
+  const sorted = [...intervals].sort(compareIntervalStart);
+  const merged: Interval[] = [];
+  for (const interval of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous || !canMerge(previous, interval)) {
+      merged.push({ min: interval.min, max: interval.max });
+      continue;
+    }
+    previous.max = laterUpper(previous.max, interval.max);
+  }
+  return merged;
+}
+
+function intervalContains(container: Interval, target: Interval): boolean {
+  const lowerCovered = !container.min
+    || Boolean(target.min && (
+      compareVersion(container.min.version, target.min.version) < 0
+      || (compareVersion(container.min.version, target.min.version) === 0
+        && (container.min.inclusive || !target.min.inclusive))
+    ));
+  if (!lowerCovered) return false;
+
+  const upperCovered = !container.max
+    || Boolean(target.max && (
+      compareVersion(container.max.version, target.max.version) > 0
+      || (compareVersion(container.max.version, target.max.version) === 0
+        && (container.max.inclusive || !target.max.inclusive))
+    ));
+  return upperCovered;
+}
+
+function rangeSubsetOf(subset: string | null, superset: string | null, kind: RuntimeKind): boolean | null {
+  const child = parseRange(subset, kind);
+  const parent = parseRange(superset, kind);
+  if (!child || !parent) return null;
+  const mergedParent = mergeIntervals(parent);
+  return child.every((interval) => mergedParent.some((container) => intervalContains(container, interval)));
+}
+
 export function nodeRequirementsOverlap(a: string | null, b: string | null): boolean | null {
   return rangesOverlap(a, b, "node");
 }
@@ -186,11 +240,24 @@ export function pythonRequirementsOverlap(a: string | null, b: string | null): b
   return rangesOverlap(a, b, "python");
 }
 
+export function nodeReadmeRequirementFitsRepo(
+  repoRequirement: string | null,
+  readmeRequirement: string | null,
+): boolean | null {
+  return rangeSubsetOf(readmeRequirement, repoRequirement, "node");
+}
+
+export function pythonReadmeRequirementFitsRepo(
+  repoRequirement: string | null,
+  readmeRequirement: string | null,
+): boolean | null {
+  return rangeSubsetOf(readmeRequirement, repoRequirement, "python");
+}
+
 export function selectNodeSandboxRuntime(requirement: string | null): NodeSandboxRuntime | null {
   if (!requirement) return "node24";
   for (const major of NODE_SANDBOX_MAJORS) {
-    const overlaps = nodeRequirementsOverlap(requirement, `>=${major} <${major + 1}`);
-    if (overlaps) return `node${major}`;
+    if (nodeRequirementsOverlap(requirement, `>=${major} <${major + 1}`)) return `node${major}`;
   }
   return null;
 }
