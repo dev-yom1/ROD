@@ -86,9 +86,6 @@ export async function downloadRepositoryArchive(
     owner,
     repo,
     ref,
-    headers: {
-      accept: "application/octet-stream",
-    },
   });
   const data = response.data as unknown;
   if (data instanceof ArrayBuffer) return Buffer.from(data);
