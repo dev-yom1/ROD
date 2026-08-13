@@ -1,4 +1,5 @@
 import type { Octokit } from "octokit";
+import { obsoleteCheckRun } from "./reporter";
 
 const CHECK_NAME = "Repo Onboarding Doctor";
 
@@ -22,18 +23,21 @@ export async function findWorkflowCheckRun(
   workflowRunId: string,
 ): Promise<number | null> {
   const idempotencyKey = externalId(workflowRunId, pullNumber);
-  const response = await octokit.request(
+  const checkRuns = await octokit.paginate(
     "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
     {
       owner,
       repo,
       ref: headSha,
       check_name: CHECK_NAME,
+      filter: "all",
+      app_id: rodAppId,
       per_page: 100,
     },
+    (response) => (response.data as { check_runs: CheckRunSummary[] }).check_runs,
   );
 
-  const existing = (response.data as { check_runs: CheckRunSummary[] }).check_runs.find(
+  const existing = (checkRuns as CheckRunSummary[]).find(
     (checkRun) => (
       checkRun.external_id === idempotencyKey
       && checkRun.app?.id === rodAppId
@@ -41,6 +45,37 @@ export async function findWorkflowCheckRun(
   );
 
   return existing?.id ?? null;
+}
+
+export async function obsoleteWorkflowCheckIfPresent(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  headSha: string,
+  rodAppId: number,
+  workflowRunId: string,
+  currentHeadSha: string,
+): Promise<boolean> {
+  const checkRunId = await findWorkflowCheckRun(
+    octokit,
+    owner,
+    repo,
+    pullNumber,
+    headSha,
+    rodAppId,
+    workflowRunId,
+  );
+  if (checkRunId === null) return false;
+
+  await obsoleteCheckRun(
+    octokit,
+    owner,
+    repo,
+    checkRunId,
+    currentHeadSha,
+  );
+  return true;
 }
 
 export async function ensureCheckRun(
