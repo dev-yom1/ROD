@@ -21,6 +21,7 @@ import { runSandboxDiagnosis } from "../runner/sandbox";
 
 export interface DiagnosePullRequestInput {
   deliveryId: string;
+  deliveryClaimToken: string;
   installationId: number;
   baseRepository: string;
   sourceRepository: string;
