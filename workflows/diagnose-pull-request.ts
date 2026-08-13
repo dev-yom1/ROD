@@ -4,6 +4,32 @@ import type {
   DiagnosePullRequestResult,
 } from "../lib/orchestrator/diagnose-pr";
 
+type DiagnoseWorkflowResult = DiagnosePullRequestResult | {
+  status: "duplicate";
+  headSha: string;
+  deliveryId: string;
+};
+
+async function confirmDeliveryStartStep(
+  input: DiagnosePullRequestInput,
+  workflowRunId: string,
+): Promise<boolean> {
+  "use step";
+
+  const { deliveryClaimConfig } = await import("../lib/config");
+  const { confirmGitHubDeliveryClaim } = await import("../lib/github/delivery-claim");
+  const confirmed = await confirmGitHubDeliveryClaim(
+    { deliveryId: input.deliveryId, token: input.deliveryClaimToken },
+    workflowRunId,
+    deliveryClaimConfig(),
+  );
+
+  console.log(
+    `[ROD workflow] delivery ownership run=${workflowRunId} delivery=${input.deliveryId} confirmed=${confirmed}`,
+  );
+  return confirmed;
+}
+
 async function runDiagnosisStep(
   input: DiagnosePullRequestInput,
   workflowRunId: string,
@@ -47,10 +73,19 @@ async function finalizeFailureStep(
 
 export async function diagnosePullRequestWorkflow(
   input: DiagnosePullRequestInput,
-): Promise<DiagnosePullRequestResult> {
+): Promise<DiagnoseWorkflowResult> {
   "use workflow";
 
   const { workflowRunId } = getWorkflowMetadata();
+  const ownsDelivery = await confirmDeliveryStartStep(input, workflowRunId);
+  if (!ownsDelivery) {
+    return {
+      status: "duplicate",
+      headSha: input.headSha,
+      deliveryId: input.deliveryId,
+    };
+  }
+
   try {
     return await runDiagnosisStep(input, workflowRunId);
   } catch (error) {
