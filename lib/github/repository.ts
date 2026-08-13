@@ -11,42 +11,34 @@ export interface RepositorySnapshotMetadata {
   lockfiles: string[];
 }
 
-async function installationToken(octokit: Octokit): Promise<string> {
-  const auth = (await octokit.auth()) as { token?: string };
-  if (!auth.token) throw new Error("Could not obtain GitHub installation token");
-  return auth.token;
-}
-
-function contentsUrl(owner: string, repo: string, path: string, ref: string): string {
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const url = new URL(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`,
-  );
-  url.searchParams.set("ref", ref);
-  return url.toString();
+function textResponse(data: unknown, path: string): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  throw new Error(`GitHub raw file read returned an unexpected response for ${path}`);
 }
 
 async function readTextFile(
-  token: string,
+  octokit: Octokit,
   owner: string,
   repo: string,
   path: string,
   ref: string,
 ): Promise<string | null> {
-  const response = await fetch(contentsUrl(owner, repo, path, ref), {
-    headers: {
-      Accept: "application/vnd.github.raw+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "repo-onboarding-doctor",
-    },
-  });
-
-  if (response.status === 404) return null;
-  if (!response.ok) {
-    throw new Error(`GitHub file read failed for ${path}: ${response.status} ${response.statusText}`);
+  try {
+    const response = await octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
+      owner,
+      repo,
+      path,
+      ref,
+      headers: {
+        accept: "application/vnd.github.raw+json",
+      },
+    });
+    return textResponse(response.data as unknown, path);
+  } catch (error) {
+    if ((error as { status?: number }).status === 404) return null;
+    throw error;
   }
-  return response.text();
 }
 
 export async function fetchRepositoryMetadata(
@@ -55,22 +47,21 @@ export async function fetchRepositoryMetadata(
   repo: string,
   ref: string,
 ): Promise<RepositorySnapshotMetadata> {
-  const token = await installationToken(octokit);
   const [readmeUpper, readmeLower, packageJson, pyproject, nvmrc, nodeVersion, pythonVersion, envExample, envSample] = await Promise.all([
-    readTextFile(token, owner, repo, "README.md", ref),
-    readTextFile(token, owner, repo, "readme.md", ref),
-    readTextFile(token, owner, repo, "package.json", ref),
-    readTextFile(token, owner, repo, "pyproject.toml", ref),
-    readTextFile(token, owner, repo, ".nvmrc", ref),
-    readTextFile(token, owner, repo, ".node-version", ref),
-    readTextFile(token, owner, repo, ".python-version", ref),
-    readTextFile(token, owner, repo, ".env.example", ref),
-    readTextFile(token, owner, repo, ".env.sample", ref),
+    readTextFile(octokit, owner, repo, "README.md", ref),
+    readTextFile(octokit, owner, repo, "readme.md", ref),
+    readTextFile(octokit, owner, repo, "package.json", ref),
+    readTextFile(octokit, owner, repo, "pyproject.toml", ref),
+    readTextFile(octokit, owner, repo, ".nvmrc", ref),
+    readTextFile(octokit, owner, repo, ".node-version", ref),
+    readTextFile(octokit, owner, repo, ".python-version", ref),
+    readTextFile(octokit, owner, repo, ".env.example", ref),
+    readTextFile(octokit, owner, repo, ".env.sample", ref),
   ]);
 
   const lockfileCandidates = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock"];
   const lockfileResults = await Promise.all(
-    lockfileCandidates.map(async (path) => ({ path, exists: (await readTextFile(token, owner, repo, path, ref)) !== null })),
+    lockfileCandidates.map(async (path) => ({ path, exists: (await readTextFile(octokit, owner, repo, path, ref)) !== null })),
   );
 
   return {
@@ -91,17 +82,16 @@ export async function downloadRepositoryArchive(
   repo: string,
   ref: string,
 ): Promise<Buffer> {
-  const token = await installationToken(octokit);
-  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${encodeURIComponent(ref)}`;
-  const response = await fetch(url, {
+  const response = await octokit.request("GET /repos/{owner}/{repo}/tarball/{ref}", {
+    owner,
+    repo,
+    ref,
     headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "repo-onboarding-doctor",
+      accept: "application/octet-stream",
     },
-    redirect: "follow",
   });
-  if (!response.ok) throw new Error(`GitHub archive download failed: ${response.status} ${response.statusText}`);
-  return Buffer.from(await response.arrayBuffer());
+  const data = response.data as unknown;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  throw new Error("GitHub archive download returned an unexpected response body");
 }
