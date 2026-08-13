@@ -33,3 +33,11 @@ test("stale retry settles an existing Workflow Check before returning", () => {
   assert.match(orchestrator, /if \(initialHeadSha !== input\.headSha\)[\s\S]*obsoleteWorkflowCheckIfPresent\(/);
   assert.match(orchestrator, /obsoleteWorkflowCheckIfPresent\([\s\S]*context\.workflowRunId[\s\S]*initialHeadSha/);
 });
+
+test("repository metadata reads raw GitHub content without object type assumptions", () => {
+  const repository = source("lib/github/repository.ts");
+  assert.match(repository, /application\/vnd\.github\.raw\+json/);
+  assert.match(repository, /Authorization: `Bearer \$\{token\}`/);
+  assert.match(repository, /response\.status === 404/);
+  assert.doesNotMatch(repository, /data\.type/);
+});
