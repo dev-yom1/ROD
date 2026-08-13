@@ -1,6 +1,7 @@
 import { buildRepoFacts } from "../analyzer/repo-facts";
 import { diagnose } from "../analyzer/diagnose";
 import { extractReadmePlan } from "../analyzer/readme";
+import { githubConfig } from "../config";
 import { getInstallationOctokit } from "../github/client";
 import { downloadRepositoryArchive, fetchRepositoryMetadata } from "../github/repository";
 import {
@@ -29,6 +30,7 @@ function splitRepository(fullName: string): { owner: string; repo: string } {
 
 export async function diagnosePullRequest(input: DiagnosePullRequestInput): Promise<void> {
   const octokit = await getInstallationOctokit(input.installationId);
+  const rodAppId = githubConfig().appId;
   const base = splitRepository(input.baseRepository);
   const source = splitRepository(input.sourceRepository);
   let checkRunId: number | null = null;
@@ -73,6 +75,7 @@ export async function diagnosePullRequest(input: DiagnosePullRequestInput): Prom
       base.repo,
       input.pullNumber,
       input.headSha,
+      rodAppId,
       report,
     );
     if (!publication.updated) {
