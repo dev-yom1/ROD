@@ -11,23 +11,42 @@ export interface RepositorySnapshotMetadata {
   lockfiles: string[];
 }
 
-async function readTextFile(octokit: Octokit, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
-  try {
-    const response = await octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
-      owner,
-      repo,
-      path,
-      ref,
-    });
-    const data = response.data as { type?: string; content?: string; encoding?: string };
-    if (data.type !== "file" || !data.content) return null;
-    if (data.encoding === "base64") return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
-    return data.content;
-  } catch (error) {
-    const status = (error as { status?: number }).status;
-    if (status === 404) return null;
-    throw error;
+async function installationToken(octokit: Octokit): Promise<string> {
+  const auth = (await octokit.auth()) as { token?: string };
+  if (!auth.token) throw new Error("Could not obtain GitHub installation token");
+  return auth.token;
+}
+
+function contentsUrl(owner: string, repo: string, path: string, ref: string): string {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const url = new URL(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`,
+  );
+  url.searchParams.set("ref", ref);
+  return url.toString();
+}
+
+async function readTextFile(
+  token: string,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | null> {
+  const response = await fetch(contentsUrl(owner, repo, path, ref), {
+    headers: {
+      Accept: "application/vnd.github.raw+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "repo-onboarding-doctor",
+    },
+  });
+
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`GitHub file read failed for ${path}: ${response.status} ${response.statusText}`);
   }
+  return response.text();
 }
 
 export async function fetchRepositoryMetadata(
@@ -36,21 +55,22 @@ export async function fetchRepositoryMetadata(
   repo: string,
   ref: string,
 ): Promise<RepositorySnapshotMetadata> {
+  const token = await installationToken(octokit);
   const [readmeUpper, readmeLower, packageJson, pyproject, nvmrc, nodeVersion, pythonVersion, envExample, envSample] = await Promise.all([
-    readTextFile(octokit, owner, repo, "README.md", ref),
-    readTextFile(octokit, owner, repo, "readme.md", ref),
-    readTextFile(octokit, owner, repo, "package.json", ref),
-    readTextFile(octokit, owner, repo, "pyproject.toml", ref),
-    readTextFile(octokit, owner, repo, ".nvmrc", ref),
-    readTextFile(octokit, owner, repo, ".node-version", ref),
-    readTextFile(octokit, owner, repo, ".python-version", ref),
-    readTextFile(octokit, owner, repo, ".env.example", ref),
-    readTextFile(octokit, owner, repo, ".env.sample", ref),
+    readTextFile(token, owner, repo, "README.md", ref),
+    readTextFile(token, owner, repo, "readme.md", ref),
+    readTextFile(token, owner, repo, "package.json", ref),
+    readTextFile(token, owner, repo, "pyproject.toml", ref),
+    readTextFile(token, owner, repo, ".nvmrc", ref),
+    readTextFile(token, owner, repo, ".node-version", ref),
+    readTextFile(token, owner, repo, ".python-version", ref),
+    readTextFile(token, owner, repo, ".env.example", ref),
+    readTextFile(token, owner, repo, ".env.sample", ref),
   ]);
 
   const lockfileCandidates = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock"];
   const lockfileResults = await Promise.all(
-    lockfileCandidates.map(async (path) => ({ path, exists: (await readTextFile(octokit, owner, repo, path, ref)) !== null })),
+    lockfileCandidates.map(async (path) => ({ path, exists: (await readTextFile(token, owner, repo, path, ref)) !== null })),
   );
 
   return {
@@ -71,14 +91,12 @@ export async function downloadRepositoryArchive(
   repo: string,
   ref: string,
 ): Promise<Buffer> {
-  const auth = (await octokit.auth()) as { token?: string };
-  if (!auth.token) throw new Error("Could not obtain GitHub installation token for archive download");
-
+  const token = await installationToken(octokit);
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${encodeURIComponent(ref)}`;
   const response = await fetch(url, {
     headers: {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${auth.token}`,
+      Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "repo-onboarding-doctor",
     },
