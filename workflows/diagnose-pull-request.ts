@@ -11,7 +11,7 @@ async function runDiagnosisStep(
   "use step";
 
   console.log(
-    `[ROD workflow] diagnosis step start run=${workflowRunId} pr=${input.baseRepository}#${input.pullNumber} sha=${input.headSha}`,
+    `[ROD workflow] diagnosis step start run=${workflowRunId} delivery=${input.deliveryId} pr=${input.baseRepository}#${input.pullNumber} sha=${input.headSha}`,
   );
 
   try {
@@ -19,12 +19,12 @@ async function runDiagnosisStep(
     const { diagnosePullRequest } = await import("../lib/orchestrator/diagnose-pr");
     const result = await diagnosePullRequest(input, { workflowRunId });
     console.log(
-      `[ROD workflow] diagnosis step done run=${workflowRunId} status=${result.status} sha=${input.headSha}`,
+      `[ROD workflow] diagnosis step done run=${workflowRunId} delivery=${input.deliveryId} status=${result.status} sha=${input.headSha}`,
     );
     return result;
   } catch (error) {
     console.error(
-      `[ROD workflow] diagnosis step attempt failed run=${workflowRunId} sha=${input.headSha}`,
+      `[ROD workflow] diagnosis step attempt failed run=${workflowRunId} delivery=${input.deliveryId} sha=${input.headSha}`,
       error,
     );
     throw error;
@@ -41,7 +41,7 @@ async function finalizeFailureStep(
   const { failPullRequestDiagnosis } = await import("../lib/orchestrator/diagnose-pr");
   await failPullRequestDiagnosis(input, { workflowRunId }, errorMessage);
   console.error(
-    `[ROD workflow] diagnosis permanently failed run=${workflowRunId} sha=${input.headSha} error=${errorMessage}`,
+    `[ROD workflow] diagnosis permanently failed run=${workflowRunId} delivery=${input.deliveryId} sha=${input.headSha} error=${errorMessage}`,
   );
 }
 
