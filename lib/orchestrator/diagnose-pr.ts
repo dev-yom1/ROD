@@ -2,7 +2,11 @@ import { buildRepoFacts } from "../analyzer/repo-facts";
 import { diagnose } from "../analyzer/diagnose";
 import { extractReadmePlan } from "../analyzer/readme";
 import { githubConfig } from "../config";
-import { ensureCheckRun, findWorkflowCheckRun } from "../github/check-run";
+import {
+  ensureCheckRun,
+  findWorkflowCheckRun,
+  obsoleteWorkflowCheckIfPresent,
+} from "../github/check-run";
 import { getInstallationOctokit } from "../github/client";
 import { downloadRepositoryArchive, fetchRepositoryMetadata } from "../github/repository";
 import {
@@ -60,8 +64,9 @@ export async function diagnosePullRequest(
   const base = splitRepository(input.baseRepository);
   const source = splitRepository(input.sourceRepository);
 
-  // A durable run may begin after a newer synchronize event has already arrived.
-  // Avoid creating a Check Run or Sandbox at all when this SHA is already stale.
+  // A retry may begin after this Workflow already created a Check Run on an older SHA.
+  // If the PR moved, settle that existing Check before returning superseded so it cannot
+  // remain in_progress forever.
   const initialHeadSha = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -69,6 +74,16 @@ export async function diagnosePullRequest(
     input.pullNumber,
   );
   if (initialHeadSha !== input.headSha) {
+    await obsoleteWorkflowCheckIfPresent(
+      octokit,
+      base.owner,
+      base.repo,
+      input.pullNumber,
+      input.headSha,
+      rodAppId,
+      context.workflowRunId,
+      initialHeadSha,
+    );
     return superseded(input.headSha, initialHeadSha);
   }
 
