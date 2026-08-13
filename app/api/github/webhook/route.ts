@@ -41,19 +41,21 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  const deliveryId = request.headers.get("x-github-delivery")?.trim();
   const installationId = payload.installation?.id;
   const baseRepository = payload.repository?.full_name;
   const sourceRepository = payload.pull_request?.head?.repo?.full_name;
   const pullNumber = payload.pull_request?.number;
   const headSha = payload.pull_request?.head?.sha;
-  if (!installationId || !baseRepository || !sourceRepository || !pullNumber || !headSha) {
+  if (!deliveryId || !installationId || !baseRepository || !sourceRepository || !pullNumber || !headSha) {
     return Response.json(
-      { ok: false, error: "incomplete pull_request payload" },
+      { ok: false, error: "incomplete pull_request delivery" },
       { status: 400 },
     );
   }
 
   const run = await start(diagnosePullRequestWorkflow, [{
+    deliveryId,
     installationId,
     baseRepository,
     sourceRepository,
@@ -62,11 +64,11 @@ export async function POST(request: Request): Promise<Response> {
   }]);
 
   console.log(
-    `[ROD webhook] started workflow run=${run.runId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
+    `[ROD webhook] started workflow run=${run.runId} delivery=${deliveryId} pr=${baseRepository}#${pullNumber} sha=${headSha}`,
   );
 
   return Response.json(
-    { ok: true, accepted: true, runId: run.runId },
+    { ok: true, accepted: true, runId: run.runId, deliveryId },
     { status: 202 },
   );
 }
