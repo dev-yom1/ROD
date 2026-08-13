@@ -1,5 +1,5 @@
 import { npmScriptReferencedByCommand } from "./readme";
-import { nodeRequirementsOverlap, pythonRequirementsOverlap } from "./runtime";
+import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
 import type { ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
 
 function excerpt(text: string, max = 500): string {
@@ -12,7 +12,7 @@ function pushRuntimeFinding(
   runtime: "Node.js" | "Python",
   repoRequirement: string | null,
   readmeRequirement: string | null,
-  overlaps: boolean | null,
+  readmeFitsRepo: boolean | null,
 ): void {
   if (repoRequirement && !readmeRequirement) {
     findings.push({
@@ -25,13 +25,13 @@ function pushRuntimeFinding(
     return;
   }
 
-  if (repoRequirement && readmeRequirement && overlaps === false) {
+  if (repoRequirement && readmeRequirement && readmeFitsRepo === false) {
     findings.push({
       code: "RUNTIME_MISMATCH",
       severity: "warning",
-      title: `README ${runtime} version disagrees with the repository`,
-      detail: `README mentions ${runtime} ${readmeRequirement}, while repository configuration indicates ${repoRequirement}. These ranges do not overlap.`,
-      suggestion: `Update the README to match ${repoRequirement}, or change the repository runtime configuration.`,
+      title: `README ${runtime} version is broader than the repository supports`,
+      detail: `README allows ${runtime} ${readmeRequirement}, while repository configuration allows ${repoRequirement}. The README range includes versions outside the repository range.`,
+      suggestion: `Narrow the README requirement so every documented version is supported by the repository, for example ${repoRequirement}.`,
     });
   }
 }
@@ -44,14 +44,14 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     "Node.js",
     facts.nodeRequirement,
     plan.nodeRequirement,
-    nodeRequirementsOverlap(facts.nodeRequirement, plan.nodeRequirement),
+    nodeReadmeRequirementFitsRepo(facts.nodeRequirement, plan.nodeRequirement),
   );
   pushRuntimeFinding(
     findings,
     "Python",
     facts.pythonRequirement,
     plan.pythonRequirement,
-    pythonRequirementsOverlap(facts.pythonRequirement, plan.pythonRequirement),
+    pythonReadmeRequirementFitsRepo(facts.pythonRequirement, plan.pythonRequirement),
   );
 
   if (run.runtimeIssue) {
@@ -102,7 +102,16 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     }
   }
 
-  if (run.install && run.install.exitCode !== 0) {
+  if (run.install?.timedOut) {
+    findings.push({
+      code: "RUNNER_TIMEOUT",
+      severity: "warning",
+      title: "ROD timed out while installing dependencies",
+      detail: `ROD stopped \`${run.install.command}\` after reaching its install execution budget. This does not prove the repository install is broken.`,
+      evidence: [excerpt(run.install.stderr || run.install.stdout)].filter(Boolean),
+      suggestion: "Treat this as an inconclusive runner limitation. Retry with a larger durable execution budget before changing repository setup instructions.",
+    });
+  } else if (run.install && run.install.exitCode !== 0) {
     findings.push({
       code: "INSTALL_BROKEN",
       severity: "error",
@@ -113,20 +122,30 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     });
   }
 
-  if (!run.runtimeIssue && run.startCommand && run.install && run.install.exitCode !== 0) {
-    // Avoid duplicating a startup failure when install already failed.
-  } else if (!run.runtimeIssue && run.startCommand && (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500)) {
-    const responseDetail = run.httpStatus === null
-      ? "No HTTP response was received from any observed application listener."
-      : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
-    findings.push({
-      code: "COMMAND_BROKEN",
-      severity: "error",
-      title: "Development server did not become reachable",
-      detail: `ROD started \`${run.startCommand}\`, but a usable HTTP endpoint was not observed. ${responseDetail}`,
-      evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
-      suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
-    });
+  const installBlockedStartup = Boolean(run.install && (run.install.timedOut || run.install.exitCode !== 0));
+  if (!run.runtimeIssue && run.startCommand && !installBlockedStartup) {
+    if (run.startupTimedOut) {
+      findings.push({
+        code: "RUNNER_TIMEOUT",
+        severity: "warning",
+        title: "ROD timed out waiting for the application to become reachable",
+        detail: `ROD started \`${run.startCommand}\`, but the process was still running when the HTTP observation budget expired. This does not prove the start command is broken.`,
+        evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
+        suggestion: "Treat this run as inconclusive or move the diagnosis to a longer-lived durable runner before changing the README.",
+      });
+    } else if (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
+      const responseDetail = run.httpStatus === null
+        ? "No HTTP response was received before the start process exited or became unusable."
+        : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
+      findings.push({
+        code: "COMMAND_BROKEN",
+        severity: "error",
+        title: "Development server did not become reachable",
+        detail: `ROD started \`${run.startCommand}\`, but a usable HTTP endpoint was not observed. ${responseDetail}`,
+        evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
+        suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
+      });
+    }
   }
 
   const observedPort = run.observedPort;
