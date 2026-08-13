@@ -20,6 +20,7 @@ import {
 import { runSandboxDiagnosis } from "../runner/sandbox";
 
 export interface DiagnosePullRequestInput {
+  deliveryId: string;
   installationId: number;
   baseRepository: string;
   sourceRepository: string;
@@ -218,6 +219,6 @@ export async function failPullRequestDiagnosis(
     base.owner,
     base.repo,
     checkRunId,
-    new Error(errorMessage),
+    new Error(`[delivery ${input.deliveryId}] ${errorMessage}`),
   );
 }
