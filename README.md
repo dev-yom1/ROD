@@ -22,6 +22,7 @@ GitHub pull_request webhook
         ▼
 Next.js route handler
   ├─ verify HMAC signature
+  ├─ capture X-GitHub-Delivery for tracing
   └─ start Workflow run → return 202 + runId
         │
         ▼
@@ -29,6 +30,7 @@ Workflow SDK
   └─ durable diagnosis step
         │
         ├─ verify PR head SHA
+        ├─ settle an earlier-attempt Check if this run became stale
         ├─ reuse this Workflow run's Check Run on retry
         ├─ read README/runtime metadata
         ├─ download source archive
@@ -57,9 +59,11 @@ Workflow functions only coordinate durable execution. GitHub, Sandbox, crypto, a
 
 ROD uses the Workflow SDK so the webhook request is no longer responsible for keeping a diagnosis alive. The webhook calls `start()` and returns immediately; the diagnosis continues with its own durable lifecycle.
 
-A run can become obsolete when a newer `synchronize` event arrives. ROD therefore checks the PR head before creating work, again immediately before Sandbox allocation, and around report publication. Obsolete runs finish without replacing the current PR report.
+A run can become obsolete when a newer `synchronize` event arrives. ROD checks the PR head before creating new work, again immediately before Sandbox allocation, and around report publication. If a retry discovers that the PR moved after an earlier attempt already created a Check Run, ROD finds that Workflow-owned Check and completes it as neutral/superseded before returning.
 
-Workflow steps retry unhandled failures. Check Runs therefore use the Workflow run ID as their retry identity: retries inside the same Workflow run reuse the same ROD-owned Check Run, while a separate Workflow run cannot overwrite that run's Check status. A final failure is written only after the diagnosis step has exhausted its retries.
+Workflow steps retry unhandled failures. Check Runs therefore use the Workflow run ID as their retry identity: retries inside the same Workflow run reuse the same ROD-owned Check Run, while a separate Workflow run cannot overwrite that run's Check status. Check lookup explicitly requests `filter=all`, scopes to the ROD GitHub App, and paginates results so an older Check is not lost behind GitHub's default latest-only filter. A final failure is written only after the diagnosis step has exhausted its retries.
+
+The webhook also requires and carries `X-GitHub-Delivery` through Workflow logs for incident tracing. **This is not yet a persistent delivery claim.** A redelivery of the same GitHub delivery can still start another Workflow run. Durable atomic delivery deduplication is tracked in issue #3 and requires a persistent create-if-absent store before `start()`.
 
 Useful local inspection commands:
 
@@ -175,3 +179,4 @@ The Workflow TypeScript plugin is enabled alongside the Next.js plugin in `tscon
 - Environment-variable detection is static and intentionally focused on common Node.js and Python patterns.
 - Semantic prose drift is not AI-assisted yet.
 - Durable execution prevents request-lifetime failures and stale runs are suppressed, but active in-flight Sandbox cancellation on a newer SHA is still a later optimization.
+- GitHub delivery GUIDs are traced but are not yet atomically claimed; issue #3 tracks persistent webhook-delivery idempotency.
