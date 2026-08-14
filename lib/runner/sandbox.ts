@@ -28,6 +28,7 @@ const INSTALL_TIMEOUT_SECONDS = 150;
 const PREP_TIMEOUT_SECONDS = 20;
 const PROBE_TIMEOUT_MS = 40_000;
 const PROBE_INTERVAL_MS = 2_000;
+const START_STABILITY_MS = 3_000;
 
 export interface SandboxDiagnosisResult {
   execution: ExecutionObservation;
@@ -213,14 +214,16 @@ function executableForCommand(command: string): string | null {
 
 function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
   const kind = readmeRuntimeKind(plan);
-  if (kind === "python") return facts.inferredPythonInstallCommand ?? facts.inferredInstallCommand;
-  if (kind === "node") return facts.inferredNodeInstallCommand ?? facts.inferredInstallCommand;
+  if (kind === "python") return facts.inferredPythonInstallCommand ?? null;
+  if (kind === "node") return facts.inferredNodeInstallCommand ?? null;
   return facts.inferredInstallCommand;
 }
 
 function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
-  if (readmeRuntimeKind(plan) === "python") return null;
-  return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  const kind = readmeRuntimeKind(plan);
+  if (kind === "python") return null;
+  if (kind === "node") return facts.inferredNodeStartCommand ?? null;
+  return facts.inferredStartCommand;
 }
 
 function plannedExecutableCommands(plan: ReadmePlan): string[] {
@@ -384,6 +387,16 @@ async function readStartExitCode(sandbox: Sandbox): Promise<number | null> {
   if (!/^-?\d+$/.test(raw)) return null;
   const value = Number(raw);
   return Number.isSafeInteger(value) ? value : null;
+}
+
+async function stabilizeSuccessfulStart(sandbox: Sandbox): Promise<number | null> {
+  const deadline = Date.now() + START_STABILITY_MS;
+  while (Date.now() < deadline) {
+    const exitCode = await readStartExitCode(sandbox);
+    if (exitCode !== null) return exitCode;
+    await sandbox.runCommand("sleep", ["1"]);
+  }
+  return await readStartExitCode(sandbox);
 }
 
 async function probeObservedUrl(
@@ -565,8 +578,10 @@ export async function runSandboxDiagnosis(
         preexistingPorts = [...baseline.keys()].sort((a, b) => a - b);
         await startApplication(sandbox, step.command);
         const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort, step.command, baseline);
+        startExitCode = probe?.status && probe.status < 500
+          ? await stabilizeSuccessfulStart(sandbox)
+          : await readStartExitCode(sandbox);
         startLog = await readStartLog(sandbox);
-        startExitCode = await readStartExitCode(sandbox);
         if (probe) {
           observedPort = probe.port;
           observedUrl = probe.url;
@@ -600,8 +615,10 @@ export async function runSandboxDiagnosis(
           preexistingPorts = [...baseline.keys()].sort((a, b) => a - b);
           await startApplication(sandbox, fallbackStart);
           const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort, fallbackStart, baseline);
+          startExitCode = probe?.status && probe.status < 500
+            ? await stabilizeSuccessfulStart(sandbox)
+            : await readStartExitCode(sandbox);
           startLog = await readStartLog(sandbox);
-          startExitCode = await readStartExitCode(sandbox);
           if (probe) {
             observedPort = probe.port;
             observedUrl = probe.url;
