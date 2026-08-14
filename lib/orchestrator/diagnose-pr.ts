@@ -1,6 +1,7 @@
 import { buildRepoFacts } from "../analyzer/repo-facts";
 import { diagnose } from "../analyzer/diagnose";
 import { extractReadmePlan } from "../analyzer/readme";
+import type { ExecutionObservation, ReadmePlan } from "../analyzer/types";
 import { githubConfig } from "../config";
 import {
   ensureCheckRun,
@@ -54,6 +55,29 @@ function splitRepository(fullName: string): { owner: string; repo: string } {
 
 function superseded(headSha: string, currentHeadSha: string): DiagnosePullRequestResult {
   return { status: "superseded", headSha, currentHeadSha };
+}
+
+function ambiguousFlowExecution(plan: ReadmePlan): ExecutionObservation {
+  return {
+    preparation: [],
+    unsupportedCommands: [],
+    install: null,
+    startCommand: null,
+    startLog: "",
+    observedPort: null,
+    observedUrl: null,
+    httpStatus: null,
+    startupTimedOut: false,
+    runtimeIssue: null,
+    runnerIssue: null,
+    stepResults: plan.steps.map((step) => ({
+      stepId: step.id,
+      status: "blocked",
+      reason: "flow-ambiguous",
+    })),
+    preexistingPorts: [],
+    startExitCode: null,
+  };
 }
 
 export async function diagnosePullRequest(
@@ -113,13 +137,6 @@ export async function diagnosePullRequest(
     envSample: metadata.envSample,
   });
 
-  const archive = await downloadRepositoryArchive(
-    octokit,
-    source.owner,
-    source.repo,
-    input.headSha,
-  );
-
   const headBeforeSandbox = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -137,7 +154,19 @@ export async function diagnosePullRequest(
     return superseded(input.headSha, headBeforeSandbox);
   }
 
-  const sandboxResult = await runSandboxDiagnosis(archive, plan, initialFacts);
+  const sandboxResult = plan.flowIssue
+    ? { requiredEnv: [], execution: ambiguousFlowExecution(plan) }
+    : await runSandboxDiagnosis(
+        await downloadRepositoryArchive(
+          octokit,
+          source.owner,
+          source.repo,
+          input.headSha,
+        ),
+        plan,
+        initialFacts,
+      );
+
   const facts = buildRepoFacts({
     packageJson: metadata.packageJson,
     pyproject: metadata.pyproject,
