@@ -3,6 +3,7 @@ import { parseEnvScanOutput } from "../analyzer/env-scan";
 import {
   parseOnboardingCommand,
   readmeRuntimeKind,
+  readmeRuntimeKinds,
 } from "../analyzer/readme";
 import {
   nodeReadmeRequirementFitsRepo,
@@ -47,9 +48,17 @@ function readmeRuntimeRequirement(kind: RuntimeKind, plan: ReadmePlan): string |
   return kind === "python" ? plan.pythonRequirement : plan.nodeRequirement;
 }
 
+function primaryRuntimeKind(plan: ReadmePlan, facts: RepoFacts): RuntimeKind {
+  const direct = readmeRuntimeKind(plan);
+  if (direct) return direct;
+  const required = readmeRuntimeKinds(plan);
+  if (required.includes("node") && facts.inferredNodeStartCommand) return "node";
+  if (required.length === 1) return required[0];
+  return facts.pythonPackageManager && !facts.nodePackageManager ? "python" : "node";
+}
+
 function runtimeCandidates(plan: ReadmePlan, facts: RepoFacts): { kind: RuntimeKind; runtimes: SandboxRuntime[]; issue: string | null } {
-  const kind = readmeRuntimeKind(plan)
-    ?? (facts.pythonPackageManager && !facts.nodePackageManager ? "python" : "node");
+  const kind = primaryRuntimeKind(plan, facts);
   const repoRequirement = repoRuntimeRequirement(kind, facts);
   const readmeRequirement = readmeRuntimeRequirement(kind, plan);
 
@@ -83,8 +92,8 @@ function extractExactVersion(output: string): string | null {
   return output.match(/\bv?(\d+\.\d+\.\d+)\b/i)?.[1] ?? null;
 }
 
-async function readActualRuntimeVersion(sandbox: Sandbox, runtime: SandboxRuntime): Promise<string | null> {
-  const commands = runtime === "python3.13"
+async function readActualRuntimeVersion(sandbox: Sandbox, kind: RuntimeKind): Promise<string | null> {
+  const commands = kind === "python"
     ? [{ cmd: "python3", args: ["--version"] }, { cmd: "python", args: ["--version"] }]
     : [{ cmd: "node", args: ["--version"] }];
 
@@ -105,20 +114,20 @@ function exactVersionFits(kind: RuntimeKind, requirement: string | null, actualV
     : nodeReadmeRequirementFitsRepo(requirement, actualVersion);
 }
 
-async function verifyActualRuntime(
+async function verifyRuntimeKind(
   sandbox: Sandbox,
-  runtime: SandboxRuntime,
+  sandboxRuntime: SandboxRuntime,
   kind: RuntimeKind,
   plan: ReadmePlan,
   facts: RepoFacts,
 ): Promise<string | null> {
-  const actualVersion = await readActualRuntimeVersion(sandbox, runtime);
+  const actualVersion = await readActualRuntimeVersion(sandbox, kind);
   const runtimeName = kind === "python" ? "Python" : "Node.js";
   const repoRequirement = repoRuntimeRequirement(kind, facts);
   const readmeRequirement = readmeRuntimeRequirement(kind, plan);
 
   if (!actualVersion) {
-    return `ROD selected ${runtime}, but could not determine its exact ${runtimeName} version before running repository code.`;
+    return `The selected flow requires ${runtimeName}, but ROD could not determine a ${runtimeName} version inside ${sandboxRuntime} before running repository code.`;
   }
 
   const checks = [
@@ -131,7 +140,22 @@ async function verifyActualRuntime(
   }
   const failed = checks.find(([, requirement, result]) => requirement && result === false);
   if (failed) {
-    return `The actual ${runtimeName} ${actualVersion} in ${runtime} does not satisfy the ${failed[0]} requirement ${failed[1]}.`;
+    return `The actual ${runtimeName} ${actualVersion} in ${sandboxRuntime} does not satisfy the ${failed[0]} requirement ${failed[1]}.`;
+  }
+  return null;
+}
+
+async function verifyRequiredRuntimeSet(
+  sandbox: Sandbox,
+  sandboxRuntime: SandboxRuntime,
+  primaryKind: RuntimeKind,
+  plan: ReadmePlan,
+  facts: RepoFacts,
+): Promise<string | null> {
+  const kinds = new Set<RuntimeKind>([primaryKind, ...readmeRuntimeKinds(plan)]);
+  for (const kind of kinds) {
+    const issue = await verifyRuntimeKind(sandbox, sandboxRuntime, kind, plan, facts);
+    if (issue) return issue;
   }
   return null;
 }
@@ -152,7 +176,7 @@ async function createCompatibleSandbox(
       ports: exposedPorts,
       env: { CI: "1", ROD_SANDBOX: "1" },
     });
-    const issue = await verifyActualRuntime(sandbox, runtime, selection.kind, plan, facts);
+    const issue = await verifyRequiredRuntimeSet(sandbox, runtime, selection.kind, plan, facts);
     if (!issue) return { sandbox, issue: null };
     lastIssue = issue;
     await sandbox.stop().catch(() => undefined);
@@ -213,16 +237,18 @@ function executableForCommand(command: string): string | null {
 }
 
 function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
-  const kind = readmeRuntimeKind(plan);
+  const kinds = readmeRuntimeKinds(plan);
+  if (kinds.length > 1) return null;
+  const kind = kinds[0] ?? readmeRuntimeKind(plan);
   if (kind === "python") return facts.inferredPythonInstallCommand ?? null;
   if (kind === "node") return facts.inferredNodeInstallCommand ?? null;
   return facts.inferredInstallCommand;
 }
 
 function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
-  const kind = readmeRuntimeKind(plan);
-  if (kind === "python") return null;
-  if (kind === "node") return facts.inferredNodeStartCommand ?? null;
+  const kinds = readmeRuntimeKinds(plan);
+  if (kinds.includes("node")) return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  if (kinds.length === 1 && kinds[0] === "python") return null;
   return facts.inferredStartCommand;
 }
 
