@@ -1,10 +1,16 @@
 import { npmScriptReferencedByCommand } from "./readme";
 import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
-import type { ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
+import type { CommandObservation, ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
+
+const ENV_COPY_COMMAND = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?(?:\s|$)/i;
 
 function excerpt(text: string, max = 500): string {
   const normalized = text.trim();
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}…`;
+}
+
+function commandFailed(command: CommandObservation): boolean {
+  return command.timedOut || command.exitCode !== 0;
 }
 
 function pushRuntimeFinding(
@@ -74,6 +80,40 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     });
   }
 
+  if (facts.inferredStartCommand && !plan.startCommand) {
+    findings.push({
+      code: "START_STEP_MISSING",
+      severity: "warning",
+      title: "Application start command is missing from the README",
+      detail: `ROD inferred \`${facts.inferredStartCommand}\` from repository configuration, but the README does not tell a new contributor how to start the application.`,
+      suggestion: `Document \`${facts.inferredStartCommand}\` (or the intended equivalent) in the README.`,
+    });
+  }
+
+  for (const command of run.unsupportedCommands) {
+    findings.push({
+      code: "RUNNER_COMMAND_UNSUPPORTED",
+      severity: "warning",
+      title: "README command could not be reproduced safely",
+      detail: `The README documents \`${command}\`, but ROD's isolated runner does not execute this shell form. Any inferred fallback command is used only to gather diagnostic signal and does not count as reproducing the documented onboarding flow.`,
+      suggestion: "Split the onboarding step into supported commands, or extend ROD's runner with a safe explicit implementation for this command form.",
+    });
+  }
+
+  for (const preparation of run.preparation.filter(commandFailed)) {
+    const output = preparation.stderr || preparation.stdout;
+    findings.push({
+      code: "PREPARATION_BROKEN",
+      severity: preparation.timedOut ? "warning" : "error",
+      title: preparation.timedOut ? "README preparation step timed out" : "README preparation step failed",
+      detail: preparation.timedOut
+        ? `ROD could not finish \`${preparation.command}\` within the preparation budget.`
+        : `\`${preparation.command}\` exited with code ${preparation.exitCode} before dependency installation/startup.`,
+      evidence: output ? [excerpt(output)] : undefined,
+      suggestion: "Fix the documented preparation step or document a portable equivalent that works in a fresh environment.",
+    });
+  }
+
   for (const command of plan.commands) {
     const script = npmScriptReferencedByCommand(command);
     if (script && !facts.scripts[script]) {
@@ -87,10 +127,13 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     }
   }
 
+  const envExamplePreparationFailed = run.preparation.some((command) => (
+    ENV_COPY_COMMAND.test(command.command) && commandFailed(command)
+  ));
   const documentedEnv = new Set(facts.envExampleVars);
   for (const name of facts.requiredEnv) {
     const namedInReadme = readme.includes(name);
-    const coveredByExample = plan.copiesEnvExample && documentedEnv.has(name);
+    const coveredByExample = plan.copiesEnvExample && !envExamplePreparationFailed && documentedEnv.has(name);
     if (!namedInReadme && !coveredByExample) {
       findings.push({
         code: "ENV_MISSING",
