@@ -82,7 +82,7 @@ npm run dev
   assert.deepEqual(plan.commands, ["npm install", "npm run dev"]);
 });
 
-test("multiple install alternatives inside one setup section select one matching start", () => {
+test("multiple install commands in one setup section are all preserved", () => {
   const readme = `## Installation
 \`\`\`bash
 npm install
@@ -95,7 +95,7 @@ pnpm run dev
 \`\`\`
 `;
   const plan = extractReadmePlan(readme);
-  assert.deepEqual(plan.commands, ["pnpm install", "pnpm run dev"]);
+  assert.deepEqual(plan.commands, ["npm install", "pnpm install", "pnpm run dev"]);
 });
 
 test("nonzero start exit is broken even when a child endpoint returns HTTP 200", () => {
