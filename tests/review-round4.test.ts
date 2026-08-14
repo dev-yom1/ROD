@@ -244,7 +244,7 @@ Open http://localhost:3000.
 Attach to http://localhost:9229.
 `);
   assert.equal(plan.expectedPort, 3000);
-  assert.equal(plan.expectedUrl, "http://localhost:3000.");
+  assert.equal(plan.expectedUrl, "http://localhost:3000");
 });
 
 test("missing runner tooling is a runner limitation rather than install failure", () => {
