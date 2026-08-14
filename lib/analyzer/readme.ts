@@ -40,6 +40,7 @@ type SectionBucket = {
 type SelectedFlow = {
   steps: ReadmeStep[];
   text: string;
+  terminalText: string;
   sections: string[];
   issue: string | null;
 };
@@ -350,10 +351,11 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
     })[0];
   if (!terminal) return null;
 
-  const terminalFence = terminal.fences.find((fence) => fence.steps.some((step) => step.role === "start"))
-    ?? terminal.fences[terminal.fences.length - 1];
+  const startFences = terminal.fences.filter((fence) => fence.steps.some((step) => step.role === "start"));
+  const terminalFence = startFences[0] ?? terminal.fences[terminal.fences.length - 1];
   const terminalStarts = terminalFence.steps.filter((step) => step.role === "start");
   const terminalStart = terminalStarts[0] ?? terminal.steps.find((step) => step.role === "start") ?? null;
+  const terminalText = proseThroughStartFence(markdown, terminal, terminalFence).join("\n");
 
   if (!terminalStart) {
     const terminalSteps = terminal.fences
@@ -361,7 +363,8 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
       .flatMap((fence) => fence.steps);
     return {
       steps: terminalSteps,
-      text: proseThroughStartFence(markdown, terminal, terminalFence).join("\n"),
+      text: terminalText,
+      terminalText,
       sections: terminal.section ? [terminal.section] : [],
       issue: null,
     };
@@ -385,7 +388,9 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
     }
   }
 
-  if (terminalStarts.length > 1) {
+  if (startFences.length > 1) {
+    flowIssue = "ROD found start commands in multiple README shell fences inside the same terminal onboarding section and cannot safely infer which alternative path to execute.";
+  } else if (terminalStarts.length > 1) {
     flowIssue = "ROD found multiple start commands in the same README shell fence and cannot safely infer which alternative onboarding path to execute.";
   }
 
@@ -401,12 +406,12 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const steps = [...setupSteps, ...terminalSteps];
   const textParts = [
     ...setupBuckets.flatMap((bucket) => bucket.lines.map((item) => item.text)),
-    ...proseThroughStartFence(markdown, terminal, terminalFence),
+    ...terminalText.split("\n"),
   ];
   const sections = [...setupBuckets, terminal]
     .map((bucket) => bucket.section)
     .filter((section): section is string => Boolean(section));
-  return { steps, text: textParts.join("\n"), sections, issue: flowIssue };
+  return { steps, text: textParts.join("\n"), terminalText, sections, issue: flowIssue };
 }
 
 function extractRuntime(markdown: string, runtime: "node" | "python"): string | null {
@@ -442,7 +447,8 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
   const installStep = steps.find((step) => step.role === "install") ?? null;
   const startStep = steps.find((step) => step.role === "start") ?? null;
   const flowText = flow?.text ?? markdown;
-  const urlMatch = flowText.match(/https?:\/\/(?:localhost|127\.0\.0\.1)(?::(\d{2,5}))?(?:\/[^\s)`]*)?/i);
+  const terminalText = flow?.terminalText ?? flowText;
+  const urlMatch = terminalText.match(/https?:\/\/(?:localhost|127\.0\.0\.1)(?::(\d{2,5}))?(?:\/[^\s)`]*)?/i);
   const expectedUrl = urlMatch?.[0] ?? null;
   const expectedPort = urlMatch?.[1] ? Number(urlMatch[1]) : null;
 
@@ -458,6 +464,8 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
     copiesEnvExample: steps.some((step) => parseOnboardingCommand(step.command, step.malformed).envCopySource !== null),
     flowSections: flow?.sections ?? [],
     flowIssue: flow?.issue ?? null,
+    flowText,
+    terminalText,
   };
 }
 
