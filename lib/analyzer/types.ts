@@ -6,6 +6,7 @@ export type FindingCode =
   | "PREPARATION_BROKEN"
   | "COMMAND_BROKEN"
   | "RUNNER_COMMAND_UNSUPPORTED"
+  | "RUNNER_PREEXISTING_LISTENER"
   | "RUNTIME_UNDOCUMENTED"
   | "RUNTIME_MISMATCH"
   | "RUNNER_RUNTIME_UNSUPPORTED"
@@ -27,7 +28,34 @@ export interface Finding {
 
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun" | "pip" | "poetry" | "uv" | null;
 
+export type ReadmeStepRole = "preparation" | "install" | "start" | "other";
+
+export interface ReadmeStep {
+  id: string;
+  command: string;
+  section: string | null;
+  fenceIndex: number;
+  line: number;
+  role: ReadmeStepRole;
+}
+
+export type StepResultStatus = "executed" | "failed" | "skipped" | "blocked";
+export type StepResultReason =
+  | "unsafe"
+  | "unsupported"
+  | "after-start"
+  | "runtime-unsupported"
+  | "previous-failure";
+
+export interface StepResult {
+  stepId: string;
+  status: StepResultStatus;
+  reason?: StepResultReason;
+  observation?: CommandObservation;
+}
+
 export interface ReadmePlan {
+  steps: ReadmeStep[];
   commands: string[];
   installCommand: string | null;
   startCommand: string | null;
@@ -68,4 +96,6 @@ export interface ExecutionObservation {
   httpStatus: number | null;
   startupTimedOut: boolean;
   runtimeIssue: string | null;
+  stepResults?: StepResult[];
+  preexistingPorts?: number[];
 }
