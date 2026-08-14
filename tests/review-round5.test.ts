@@ -113,9 +113,9 @@ test("nonzero start exit is broken even when a child endpoint returns HTTP 200",
 });
 
 test("compound runtime alternatives preserve comparator grouping", () => {
-  const readme = `Requires Node.js >=22 <23 or >=24 <25.
+  const readme = `## Development
+Requires Node.js >=22 <23 or >=24 <25.
 
-## Development
 \`\`\`bash
 npm install
 npm run dev
@@ -144,9 +144,9 @@ npm run dev
 });
 
 test("README runtime narrows the Sandbox candidate set", () => {
-  const readme = `Requires Node.js 26.
+  const readme = `## Development
+Requires Node.js 26.
 
-## Development
 \`\`\`bash
 npm install
 npm run dev
