@@ -286,6 +286,9 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
   }
 
   if (run.startCommand && !installBlockedStartup) {
+    const startExitedWithFailure = run.startExitCode !== null
+      && run.startExitCode !== undefined
+      && run.startExitCode !== 0;
     if (run.startupTimedOut) {
       findings.push({
         code: "RUNNER_TIMEOUT",
@@ -295,18 +298,20 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
         evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Treat this run as inconclusive or move the diagnosis to a longer-lived durable runner before changing the README.",
       });
-    } else if (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
+    } else if (startExitedWithFailure || run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
       const exited = run.startExitCode !== null && run.startExitCode !== undefined
         ? ` The start process exited with code ${run.startExitCode}.`
         : "";
       const responseDetail = run.httpStatus === null
         ? "No usable new HTTP response was observed."
-        : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
+        : startExitedWithFailure && run.httpStatus < 500
+          ? `A child or leftover endpoint returned HTTP ${run.httpStatus}, but that does not override the failed start command.`
+          : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
       findings.push({
         code: "COMMAND_BROKEN",
         severity: "error",
-        title: "Development server did not become reachable",
-        detail: `ROD launched the selected start command, but it did not produce a usable application endpoint.${exited} ${responseDetail}`,
+        title: startExitedWithFailure ? "Development start command failed" : "Development server did not become reachable",
+        detail: `ROD launched the selected start command, but it did not complete as a successful reproducible startup.${exited} ${responseDetail}`,
         evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
       });
