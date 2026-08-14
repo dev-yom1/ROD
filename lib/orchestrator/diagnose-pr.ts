@@ -1,6 +1,7 @@
 import { buildRepoFacts } from "../analyzer/repo-facts";
 import { diagnose } from "../analyzer/diagnose";
 import { extractReadmePlan } from "../analyzer/readme";
+import type { ExecutionObservation, ReadmePlan } from "../analyzer/types";
 import { githubConfig } from "../config";
 import {
   ensureCheckRun,
@@ -56,6 +57,29 @@ function superseded(headSha: string, currentHeadSha: string): DiagnosePullReques
   return { status: "superseded", headSha, currentHeadSha };
 }
 
+function ambiguousFlowExecution(plan: ReadmePlan): ExecutionObservation {
+  return {
+    preparation: [],
+    unsupportedCommands: [],
+    install: null,
+    startCommand: null,
+    startLog: "",
+    observedPort: null,
+    observedUrl: null,
+    httpStatus: null,
+    startupTimedOut: false,
+    runtimeIssue: null,
+    runnerIssue: null,
+    stepResults: plan.steps.map((step) => ({
+      stepId: step.id,
+      status: "blocked",
+      reason: "flow-ambiguous",
+    })),
+    preexistingPorts: [],
+    startExitCode: null,
+  };
+}
+
 export async function diagnosePullRequest(
   input: DiagnosePullRequestInput,
   context: DiagnosePullRequestContext,
@@ -65,9 +89,6 @@ export async function diagnosePullRequest(
   const base = splitRepository(input.baseRepository);
   const source = splitRepository(input.sourceRepository);
 
-  // A retry may begin after this Workflow already created a Check Run on an older SHA.
-  // If the PR moved, settle that existing Check before returning superseded so it cannot
-  // remain in_progress forever.
   const initialHeadSha = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -113,17 +134,9 @@ export async function diagnosePullRequest(
     pythonVersion: metadata.pythonVersion,
     lockfiles: metadata.lockfiles,
     envExample: metadata.envExample,
+    envSample: metadata.envSample,
   });
 
-  const archive = await downloadRepositoryArchive(
-    octokit,
-    source.owner,
-    source.repo,
-    input.headSha,
-  );
-
-  // Archive download is cheap compared with starting an isolated runtime. Re-check
-  // immediately before Sandbox allocation so queued/slow obsolete runs exit here.
   const headBeforeSandbox = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -141,7 +154,19 @@ export async function diagnosePullRequest(
     return superseded(input.headSha, headBeforeSandbox);
   }
 
-  const sandboxResult = await runSandboxDiagnosis(archive, plan, initialFacts);
+  const sandboxResult = plan.flowIssue
+    ? { requiredEnv: [], execution: ambiguousFlowExecution(plan) }
+    : await runSandboxDiagnosis(
+        await downloadRepositoryArchive(
+          octokit,
+          source.owner,
+          source.repo,
+          input.headSha,
+        ),
+        plan,
+        initialFacts,
+      );
+
   const facts = buildRepoFacts({
     packageJson: metadata.packageJson,
     pyproject: metadata.pyproject,
@@ -150,6 +175,7 @@ export async function diagnosePullRequest(
     pythonVersion: metadata.pythonVersion,
     lockfiles: metadata.lockfiles,
     envExample: metadata.envExample,
+    envSample: metadata.envSample,
     requiredEnv: sandboxResult.requiredEnv,
   });
   const findings = diagnose(metadata.readme, plan, facts, sandboxResult.execution);

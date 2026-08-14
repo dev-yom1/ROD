@@ -8,6 +8,7 @@ export interface RepositorySnapshotMetadata {
   nodeVersion: string | null;
   pythonVersion: string | null;
   envExample: string | null;
+  envSample: string | null;
   lockfiles: string[];
 }
 
@@ -71,7 +72,8 @@ export async function fetchRepositoryMetadata(
     nvmrc,
     nodeVersion,
     pythonVersion,
-    envExample: envExample ?? envSample,
+    envExample,
+    envSample,
     lockfiles: lockfileResults.filter((item) => item.exists).map((item) => item.path),
   };
 }

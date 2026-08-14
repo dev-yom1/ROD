@@ -14,6 +14,8 @@ import {
 import type { ExecutionObservation } from "../lib/analyzer/types";
 
 const EMPTY_RUN: ExecutionObservation = {
+  preparation: [],
+  unsupportedCommands: [],
   install: null,
   startCommand: null,
   startLog: "",
@@ -70,7 +72,7 @@ test("reports missing install step and runtime documentation", () => {
   assert(findings.some((finding) => finding.code === "RUNTIME_UNDOCUMENTED"));
 });
 
-test("supports root env example copies to Next.js env destinations", () => {
+test("supports successful root env example copies to Next.js env destinations", () => {
   for (const destination of [".env", ".env.local", ".env.development.local"]) {
     const command = `cp .env.example ${destination}`;
     const readme = `# App\n\n\`\`\`bash\n${command}\nnpm ci\n\`\`\``;
@@ -85,9 +87,14 @@ test("supports root env example copies to Next.js env destinations", () => {
       envExample: "DATABASE_URL=\n",
       requiredEnv: ["DATABASE_URL"],
     });
+    const run: ExecutionObservation = {
+      ...EMPTY_RUN,
+      preparation: [{ command, exitCode: 0, stdout: "", stderr: "", timedOut: false }],
+      install: { command: "npm ci", exitCode: 0, stdout: "", stderr: "", timedOut: false },
+    };
     assert.equal(plan.copiesEnvExample, true);
     assert.equal(isSafeOnboardingCommand(command), true);
-    assert(!diagnose(readme, plan, facts, EMPTY_RUN).some((finding) => finding.code === "ENV_MISSING"));
+    assert(!diagnose(readme, plan, facts, run).some((finding) => finding.code === "ENV_MISSING"));
   }
   assert.equal(isSafeOnboardingCommand("cp .env.example ../.env"), false);
 });
@@ -201,4 +208,95 @@ test("HTTP 5xx is a startup failure", () => {
   };
   const findings = diagnose("", extractReadmePlan(""), BASE_FACTS, run);
   assert(findings.some((finding) => finding.code === "COMMAND_BROKEN"));
+});
+
+test("missing README start command is reported even when inferred fallback reaches the app", () => {
+  const readme = `# App\n\n\`\`\`bash\nnpm install\n\`\`\`\n\nOpen http://localhost:3000.`;
+  const plan = extractReadmePlan(readme);
+  const facts = {
+    ...BASE_FACTS,
+    inferredInstallCommand: "npm install",
+  };
+  const run: ExecutionObservation = {
+    ...EMPTY_RUN,
+    install: { command: "npm install", exitCode: 0, stdout: "", stderr: "", timedOut: false },
+    startCommand: "npm run dev",
+    observedPort: 3000,
+    observedUrl: "https://sandbox.example",
+    httpStatus: 200,
+  };
+  const findings = diagnose(readme, plan, facts, run);
+  assert(findings.some((finding) => finding.code === "START_STEP_MISSING"));
+  assert(!findings.some((finding) => finding.code === "COMMAND_BROKEN"));
+});
+
+test("unsupported documented install command cannot be hidden by a successful inferred fallback", () => {
+  const readme = `# App\n\n\`\`\`bash\nnpm ci && npm run build\nnpm run dev\n\`\`\`\n\nOpen http://localhost:3000.`;
+  const plan = extractReadmePlan(readme);
+  const facts = {
+    ...BASE_FACTS,
+    inferredInstallCommand: "npm ci",
+  };
+  const run: ExecutionObservation = {
+    ...EMPTY_RUN,
+    unsupportedCommands: ["npm ci && npm run build"],
+    install: { command: "npm ci", exitCode: 0, stdout: "", stderr: "", timedOut: false },
+    startCommand: "npm run dev",
+    observedPort: 3000,
+    observedUrl: "https://sandbox.example",
+    httpStatus: 200,
+  };
+  const findings = diagnose(readme, plan, facts, run);
+  assert(findings.some((finding) => finding.code === "RUNNER_COMMAND_UNSUPPORTED"));
+  assert(!findings.some((finding) => finding.code === "INSTALL_BROKEN"));
+});
+
+test("failed env preparation is reported and no longer suppresses ENV_MISSING", () => {
+  const readme = `# App\n\n\`\`\`bash\ncopy .env.example .env\nnpm install\nnpm run dev\n\`\`\``;
+  const plan = extractReadmePlan(readme);
+  const facts = {
+    ...BASE_FACTS,
+    inferredInstallCommand: "npm install",
+    requiredEnv: ["DATABASE_URL"],
+    envExampleVars: ["DATABASE_URL"],
+  };
+  const run: ExecutionObservation = {
+    ...EMPTY_RUN,
+    preparation: [{
+      command: "copy .env.example .env",
+      exitCode: 1,
+      stdout: "",
+      stderr: "copy failed",
+      timedOut: false,
+    }],
+  };
+  const findings = diagnose(readme, plan, facts, run);
+  assert(findings.some((finding) => finding.code === "PREPARATION_BROKEN"));
+  assert(findings.some((finding) => finding.code === "ENV_MISSING"));
+});
+
+test("an observed undocumented port is START_URL_UNDOCUMENTED, not COMMAND_BROKEN", () => {
+  const readme = `# App\n\n\`\`\`bash\nnpm install\nnpm run dev -- --port 4000\n\`\`\``;
+  const plan = extractReadmePlan(readme);
+  const run: ExecutionObservation = {
+    ...EMPTY_RUN,
+    startCommand: "npm run dev -- --port 4000",
+    observedPort: 4000,
+    observedUrl: "https://sandbox.example",
+    httpStatus: 200,
+  };
+  const findings = diagnose(readme, plan, BASE_FACTS, run);
+  assert(findings.some((finding) => finding.code === "START_URL_UNDOCUMENTED"));
+  assert(!findings.some((finding) => finding.code === "COMMAND_BROKEN"));
+});
+
+test("unsupported working-directory step is surfaced explicitly", () => {
+  const readme = `# App\n\n\`\`\`bash\ncd frontend\nnpm install\nnpm run dev\n\`\`\``;
+  const plan = extractReadmePlan(readme);
+  const run: ExecutionObservation = {
+    ...EMPTY_RUN,
+    unsupportedCommands: ["cd frontend"],
+  };
+  const findings = diagnose(readme, plan, BASE_FACTS, run);
+  assert(findings.some((finding) => finding.code === "RUNNER_COMMAND_UNSUPPORTED"));
 });

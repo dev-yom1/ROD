@@ -1,10 +1,75 @@
-import { npmScriptReferencedByCommand } from "./readme";
+import {
+  npmScriptReferencedByCommand,
+  parseOnboardingCommand,
+  readmeRuntimeKind,
+  readmeRuntimeKinds,
+} from "./readme";
 import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
-import type { ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
+import type {
+  CommandObservation,
+  EnvTemplateName,
+  ExecutionObservation,
+  Finding,
+  ReadmePlan,
+  ReadmeStep,
+  RepoFacts,
+  StepResult,
+} from "./types";
+
+const LEGACY_ENV_COPY = /^(?:cp|copy)\s+(\.env(?:\.example|\.sample))\s+\.env(?:\.local|\.development\.local)?\s*$/i;
 
 function excerpt(text: string, max = 500): string {
   const normalized = text.trim();
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}…`;
+}
+
+function commandFailed(command: CommandObservation): boolean {
+  return command.timedOut || command.exitCode !== 0;
+}
+
+function stepResultById(run: ExecutionObservation): Map<string, StepResult> | null {
+  if (!run.stepResults) return null;
+  return new Map(run.stepResults.map((result) => [result.stepId, result]));
+}
+
+function unreproducedSteps(plan: ReadmePlan, run: ExecutionObservation): ReadmeStep[] {
+  const resultMap = stepResultById(run);
+  if (resultMap) {
+    return plan.steps.filter((step) => {
+      const result = resultMap.get(step.id);
+      if (!result) return true;
+      return result.status === "skipped"
+        && ["unsafe", "unsupported", "malformed", "after-start"].includes(result.reason ?? "");
+    });
+  }
+
+  const reproduced = new Set(run.preparation.map((command) => command.command));
+  if (plan.installCommand && run.install?.command === plan.installCommand) reproduced.add(plan.installCommand);
+  if (plan.startCommand && run.startCommand === plan.startCommand) reproduced.add(plan.startCommand);
+  return plan.steps.filter((step) => !reproduced.has(step.command));
+}
+
+function successfulEnvCopySources(plan: ReadmePlan, run: ExecutionObservation): Set<EnvTemplateName> {
+  const sources = new Set<EnvTemplateName>();
+  const resultMap = stepResultById(run);
+  if (resultMap) {
+    for (const step of plan.steps) {
+      const parsed = parseOnboardingCommand(step.command, step.malformed);
+      if (!parsed.envCopySource) continue;
+      const result = resultMap.get(step.id);
+      if (result?.status === "executed" && result.observation && !commandFailed(result.observation)) {
+        sources.add(parsed.envCopySource);
+      }
+    }
+    return sources;
+  }
+
+  for (const command of run.preparation) {
+    if (commandFailed(command)) continue;
+    const match = command.command.match(LEGACY_ENV_COPY);
+    if (match) sources.add(match[1].toLowerCase() as EnvTemplateName);
+  }
+  return sources;
 }
 
 function pushRuntimeFinding(
@@ -36,6 +101,37 @@ function pushRuntimeFinding(
   }
 }
 
+function preexistingExpectedPortConflict(plan: ReadmePlan, run: ExecutionObservation): number | null {
+  if (!run.preexistingPorts?.length || run.observedPort !== null) return null;
+  if (plan.expectedPort && run.preexistingPorts.includes(plan.expectedPort)) return plan.expectedPort;
+  if (run.startCommand) {
+    const hinted = parseOnboardingCommand(run.startCommand).portHints[0] ?? null;
+    if (hinted && run.preexistingPorts.includes(hinted)) return hinted;
+  }
+  return null;
+}
+
+function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  const runtimes = readmeRuntimeKinds(plan);
+  if (runtimes.length > 1) return null;
+  const runtime = runtimes[0] ?? readmeRuntimeKind(plan);
+  if (runtime === "python") return facts.inferredPythonInstallCommand ?? null;
+  if (runtime === "node") return facts.inferredNodeInstallCommand ?? null;
+  return facts.inferredInstallCommand;
+}
+
+function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  const runtimes = readmeRuntimeKinds(plan);
+  if (runtimes.includes("node")) return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  if (runtimes.length === 1 && runtimes[0] === "python") return null;
+  return facts.inferredStartCommand;
+}
+
+function readmeMentionsEnv(readme: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^A-Z0-9_])${escaped}(?![A-Z0-9_])`, "m").test(readme);
+}
+
 export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run: ExecutionObservation): Finding[] {
   const findings: Finding[] = [];
 
@@ -54,6 +150,17 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     pythonReadmeRequirementFitsRepo(facts.pythonRequirement, plan.pythonRequirement),
   );
 
+  if (plan.flowIssue) {
+    findings.push({
+      code: "FLOW_AMBIGUOUS",
+      severity: "warning",
+      title: "README onboarding flow is ambiguous",
+      detail: plan.flowIssue,
+      suggestion: "Separate alternative setup/start paths into clearly labeled sections or document one canonical onboarding path.",
+    });
+    return findings;
+  }
+
   if (run.runtimeIssue) {
     findings.push({
       code: "RUNNER_RUNTIME_UNSUPPORTED",
@@ -63,41 +170,101 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       suggestion: "Treat this as a ROD runner limitation, not a repository setup failure.",
     });
   }
+  if (run.runnerIssue) {
+    findings.push({
+      code: "RUNNER_TOOL_UNSUPPORTED",
+      severity: "warning",
+      title: "ROD runner is missing a required onboarding tool",
+      detail: run.runnerIssue,
+      suggestion: "Treat this as a ROD runner capability gap rather than a broken repository command.",
+    });
+  }
 
-  if (facts.inferredInstallCommand && !plan.installCommand) {
+  const inferredInstall = inferredInstallForPlan(plan, facts);
+  const inferredStart = inferredStartForPlan(plan, facts);
+  if (inferredInstall && !plan.installCommand) {
     findings.push({
       code: "INSTALL_STEP_MISSING",
       severity: "warning",
       title: "Dependency installation is missing from the README",
-      detail: `ROD inferred that dependencies must be installed with \`${facts.inferredInstallCommand}\`, but found no install step in README shell examples.`,
-      suggestion: `Document \`${facts.inferredInstallCommand}\` before the development/start command.`,
+      detail: "ROD inferred that dependency installation is required, but found no install step in the selected onboarding flow.",
+      suggestion: "Document the dependency installation command before the development/start command.",
+      evidence: [inferredInstall],
     });
   }
 
-  for (const command of plan.commands) {
-    const script = npmScriptReferencedByCommand(command);
+  if (inferredStart && !plan.startCommand) {
+    findings.push({
+      code: "START_STEP_MISSING",
+      severity: "warning",
+      title: "Application start command is missing from the README",
+      detail: "ROD inferred a start command from repository configuration, but the selected onboarding flow does not tell a new contributor how to start the application.",
+      suggestion: "Document the intended development/start command in the onboarding flow.",
+      evidence: [inferredStart],
+    });
+  }
+
+  for (const step of plan.steps) {
+    const script = npmScriptReferencedByCommand(step.command);
     if (script && !facts.scripts[script]) {
       findings.push({
         code: "DOC_STALE",
         severity: "warning",
         title: `README references a missing script: ${script}`,
-        detail: `The command \`${command}\` refers to a package script that is not present in package.json.`,
+        detail: "A command in the selected onboarding flow refers to a package script that is not present in package.json.",
+        evidence: [step.command],
         suggestion: "Remove the stale command or restore the script it refers to.",
       });
     }
   }
 
-  const documentedEnv = new Set(facts.envExampleVars);
+  if (run.runtimeIssue || run.runnerIssue) return findings;
+
+  for (const step of unreproducedSteps(plan, run)) {
+    findings.push({
+      code: "RUNNER_COMMAND_UNSUPPORTED",
+      severity: "warning",
+      title: step.malformed ? "README shell command is incomplete" : "README command was not reproduced",
+      detail: step.malformed
+        ? "The selected onboarding flow contains an unfinished shell continuation, so ROD did not repair or execute it."
+        : "ROD did not reproduce this occurrence in the selected onboarding flow. Inferred fallback commands are diagnostic-only and never count as reproducing a documented step.",
+      evidence: [step.command],
+      suggestion: step.malformed
+        ? "Complete the multiline shell command in the README."
+        : "Teach ROD how to reproduce this step explicitly, or rewrite the onboarding flow using runner-supported commands.",
+    });
+  }
+
+  for (const preparation of run.preparation.filter(commandFailed)) {
+    const output = preparation.stderr || preparation.stdout;
+    findings.push({
+      code: "PREPARATION_BROKEN",
+      severity: preparation.timedOut ? "warning" : "error",
+      title: preparation.timedOut ? "README preparation step timed out" : "README preparation step failed",
+      detail: preparation.timedOut
+        ? "ROD could not finish a documented preparation step within the preparation budget."
+        : `A documented preparation step exited with code ${preparation.exitCode} before dependency installation/startup.`,
+      evidence: [preparation.command, output].filter(Boolean),
+      suggestion: "Fix the documented preparation step or document a portable equivalent that works in a fresh environment.",
+    });
+  }
+
+  const successfulCopySources = successfulEnvCopySources(plan, run);
+  const onboardingText = plan.flowText ?? readme;
   for (const name of facts.requiredEnv) {
-    const namedInReadme = readme.includes(name);
-    const coveredByExample = plan.copiesEnvExample && documentedEnv.has(name);
+    const namedInReadme = readmeMentionsEnv(onboardingText, name);
+    const coveredByExample = [...successfulCopySources].some((source) => {
+      const vars = facts.envFileVars?.[source]
+        ?? (source === ".env.example" ? facts.envExampleVars : []);
+      return vars.includes(name);
+    });
     if (!namedInReadme && !coveredByExample) {
       findings.push({
         code: "ENV_MISSING",
         severity: "warning",
         title: `Environment variable ${name} is not documented`,
-        detail: `Source code references \`${name}\`, but the README does not mention it and the documented .env example flow does not cover it.`,
-        suggestion: `Document \`${name}\` or add it to .env.example and tell users to copy that file.`,
+        detail: `Source code references ${name}, but the selected onboarding flow does not mention it and a successfully copied env template did not contain it.`,
+        suggestion: `Document ${name} in the local onboarding flow or add it to the env template that the README actually tells users to copy.`,
       });
     }
   }
@@ -107,8 +274,8 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       code: "RUNNER_TIMEOUT",
       severity: "warning",
       title: "ROD timed out while installing dependencies",
-      detail: `ROD stopped \`${run.install.command}\` after reaching its install execution budget. This does not prove the repository install is broken.`,
-      evidence: [excerpt(run.install.stderr || run.install.stdout)].filter(Boolean),
+      detail: "ROD reached its install execution budget. This does not prove the repository install is broken.",
+      evidence: [run.install.command, excerpt(run.install.stderr || run.install.stdout)].filter(Boolean),
       suggestion: "Treat this as an inconclusive runner limitation. Retry with a larger durable execution budget before changing repository setup instructions.",
     });
   } else if (run.install && run.install.exitCode !== 0) {
@@ -116,33 +283,52 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       code: "INSTALL_BROKEN",
       severity: "error",
       title: "Fresh dependency installation failed",
-      detail: `\`${run.install.command}\` exited with code ${run.install.exitCode}.`,
-      evidence: [excerpt(run.install.stderr || run.install.stdout)],
+      detail: `The dependency installation step exited with code ${run.install.exitCode}.`,
+      evidence: [run.install.command, excerpt(run.install.stderr || run.install.stdout)].filter(Boolean),
       suggestion: "Update the install instructions or dependency/lockfile state so a clean environment can install successfully.",
     });
   }
 
   const installBlockedStartup = Boolean(run.install && (run.install.timedOut || run.install.exitCode !== 0));
-  if (!run.runtimeIssue && run.startCommand && !installBlockedStartup) {
+  const preexistingConflict = preexistingExpectedPortConflict(plan, run);
+  if (preexistingConflict !== null) {
+    findings.push({
+      code: "RUNNER_PREEXISTING_LISTENER",
+      severity: "warning",
+      title: "Expected startup port was already in use before the start command",
+      detail: `Port ${preexistingConflict} was already listening immediately before ROD launched the documented start command. ROD requires a new listener or a listener that disappears and is rebound after start.`,
+      suggestion: "Ensure install/preparation steps do not leave a background server running on the application port.",
+    });
+  }
+
+  if (run.startCommand && !installBlockedStartup) {
+    const startExitedWithFailure = run.startExitCode !== null
+      && run.startExitCode !== undefined
+      && run.startExitCode !== 0;
     if (run.startupTimedOut) {
       findings.push({
         code: "RUNNER_TIMEOUT",
         severity: "warning",
         title: "ROD timed out waiting for the application to become reachable",
-        detail: `ROD started \`${run.startCommand}\`, but the process was still running when the HTTP observation budget expired. This does not prove the start command is broken.`,
-        evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
+        detail: "The start process was still running when the HTTP observation budget expired. This does not prove the start command is broken.",
+        evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Treat this run as inconclusive or move the diagnosis to a longer-lived durable runner before changing the README.",
       });
-    } else if (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
+    } else if (startExitedWithFailure || run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
+      const exited = run.startExitCode !== null && run.startExitCode !== undefined
+        ? ` The start process exited with code ${run.startExitCode}.`
+        : "";
       const responseDetail = run.httpStatus === null
-        ? "No HTTP response was received before the start process exited or became unusable."
-        : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
+        ? "No usable new HTTP response was observed."
+        : startExitedWithFailure && run.httpStatus < 500
+          ? `A child or leftover endpoint returned HTTP ${run.httpStatus}, but that does not override the failed start command.`
+          : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
       findings.push({
         code: "COMMAND_BROKEN",
         severity: "error",
-        title: "Development server did not become reachable",
-        detail: `ROD started \`${run.startCommand}\`, but a usable HTTP endpoint was not observed. ${responseDetail}`,
-        evidence: run.startLog ? [excerpt(run.startLog)] : undefined,
+        title: startExitedWithFailure ? "Development start command failed" : "Development server did not become reachable",
+        detail: `ROD launched the selected start command, but it did not complete as a successful reproducible startup.${exited} ${responseDetail}`,
+        evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
       });
     }
@@ -157,13 +343,21 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       detail: `README points to port ${plan.expectedPort}, but the HTTP endpoint ROD reached was on port ${observedPort}.`,
       suggestion: `Change the README URL to use port ${observedPort}, or configure the app to use ${plan.expectedPort}.`,
     });
-  } else if (observedPort && !plan.expectedPort) {
+  } else if (observedPort && !plan.expectedPort && !plan.expectedUrl) {
     findings.push({
       code: "START_URL_UNDOCUMENTED",
       severity: "info",
       title: "Startup URL is not documented",
-      detail: `ROD reached the app on port ${observedPort}, but README does not provide a localhost URL with a port.`,
-      suggestion: `Add a line such as \`http://localhost:${observedPort}\` after the start command.`,
+      detail: `ROD reached the app on port ${observedPort}, but the selected onboarding flow does not provide a localhost URL.`,
+      suggestion: `Add a line such as http://localhost:${observedPort} after the start command.`,
+    });
+  } else if (observedPort && !plan.expectedPort && plan.expectedUrl) {
+    findings.push({
+      code: "START_PORT_UNDOCUMENTED",
+      severity: "info",
+      title: "Startup port is not documented",
+      detail: `The selected onboarding flow documents ${plan.expectedUrl}, but omits a port while ROD reached the app on port ${observedPort}.`,
+      suggestion: `Document the actual development URL including port ${observedPort}.`,
     });
   }
 

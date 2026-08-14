@@ -1,4 +1,4 @@
-import type { PackageManager, RepoFacts } from "./types";
+import type { EnvTemplateName, PackageManager, RepoFacts } from "./types";
 
 export interface RepoMetadataInput {
   packageJson: string | null;
@@ -8,6 +8,7 @@ export interface RepoMetadataInput {
   pythonVersion: string | null;
   lockfiles: string[];
   envExample: string | null;
+  envSample?: string | null;
   requiredEnv?: string[];
 }
 
@@ -26,37 +27,43 @@ function safeJson<T>(value: string | null): T | null {
   }
 }
 
-function detectPackageManager(pkg: PackageJsonShape | null, lockfiles: string[]): PackageManager {
-  const declared = pkg?.packageManager?.split("@")[0];
+function detectNodePackageManager(pkg: PackageJsonShape | null, lockfiles: string[]): PackageManager {
+  if (!pkg) return null;
+  const declared = pkg.packageManager?.split("@")[0];
   if (declared === "npm" || declared === "pnpm" || declared === "yarn" || declared === "bun") return declared;
   if (lockfiles.includes("pnpm-lock.yaml")) return "pnpm";
   if (lockfiles.includes("yarn.lock")) return "yarn";
   if (lockfiles.includes("bun.lock") || lockfiles.includes("bun.lockb")) return "bun";
-  if (lockfiles.includes("package-lock.json")) return "npm";
+  return "npm";
+}
+
+function detectPythonPackageManager(pyproject: string | null, lockfiles: string[]): PackageManager {
+  if (!pyproject) return null;
+  if (/\[tool\.poetry\]/.test(pyproject) || lockfiles.includes("poetry.lock")) return "poetry";
+  if (/\[tool\.uv\]/.test(pyproject) || lockfiles.includes("uv.lock")) return "uv";
+  return "pip";
+}
+
+function inferNodeInstallCommand(manager: PackageManager, lockfiles: string[]): string | null {
+  if (!manager) return null;
+  if (manager === "pnpm") return "pnpm install --frozen-lockfile";
+  if (manager === "yarn") return "yarn install --immutable";
+  if (manager === "bun") return "bun install --frozen-lockfile";
+  return lockfiles.includes("package-lock.json") ? "npm ci" : "npm install";
+}
+
+function inferPythonInstallCommand(manager: PackageManager): string | null {
+  if (manager === "poetry") return "poetry install";
+  if (manager === "uv") return "uv sync";
+  if (manager === "pip") return "python -m pip install -e .";
   return null;
 }
 
-function inferInstallCommand(manager: PackageManager, hasPackageJson: boolean, hasPyproject: boolean, lockfiles: string[]): string | null {
-  if (hasPackageJson) {
-    if (manager === "pnpm") return "pnpm install --frozen-lockfile";
-    if (manager === "yarn") return "yarn install --immutable";
-    if (manager === "bun") return "bun install --frozen-lockfile";
-    return lockfiles.includes("package-lock.json") ? "npm ci" : "npm install";
-  }
-  if (hasPyproject) {
-    if (manager === "poetry") return "poetry install";
-    if (manager === "uv") return "uv sync";
-    return "python -m pip install -e .";
-  }
-  return null;
-}
-
-function extractPythonRequirement(pyproject: string | null, pythonVersion: string | null): string | null {
-  if (pythonVersion?.trim()) return pythonVersion.trim();
+function extractPythonRequirement(pyproject: string | null): string | null {
   return pyproject?.match(/requires-python\s*=\s*["']([^"']+)["']/i)?.[1] ?? null;
 }
 
-function parseEnvExample(text: string | null): string[] {
+function parseEnvTemplate(text: string | null): string[] {
   if (!text) return [];
   const vars = new Set<string>();
   for (const line of text.split("\n")) {
@@ -68,30 +75,41 @@ function parseEnvExample(text: string | null): string[] {
 
 export function buildRepoFacts(input: RepoMetadataInput): RepoFacts {
   const pkg = safeJson<PackageJsonShape>(input.packageJson);
-  let manager = detectPackageManager(pkg, input.lockfiles);
-  if (!pkg && input.pyproject) {
-    if (/\[tool\.poetry\]/.test(input.pyproject)) manager = "poetry";
-    else if (/\[tool\.uv\]|uv\.lock/.test(input.pyproject) || input.lockfiles.includes("uv.lock")) manager = "uv";
-    else manager = "pip";
-  }
-
+  const nodePackageManager = detectNodePackageManager(pkg, input.lockfiles);
+  const pythonPackageManager = detectPythonPackageManager(input.pyproject, input.lockfiles);
   const scripts = pkg?.scripts ?? {};
-  const effectiveManager = manager ?? "npm";
-  const scriptCommand = (script: string) => `${effectiveManager}${effectiveManager === "npm" ? " run" : ""} ${script}`;
-  const inferredStartCommand = scripts.dev
+  const nodeManagerForScripts = nodePackageManager ?? "npm";
+  const scriptCommand = (script: string) => `${nodeManagerForScripts}${nodeManagerForScripts === "npm" ? " run" : ""} ${script}`;
+  const inferredNodeStartCommand = scripts.dev
     ? scriptCommand("dev")
     : scripts.start
       ? scriptCommand("start")
       : null;
+  const inferredNodeInstallCommand = inferNodeInstallCommand(nodePackageManager, input.lockfiles);
+  const inferredPythonInstallCommand = inferPythonInstallCommand(pythonPackageManager);
+  const envFileVars: Partial<Record<EnvTemplateName, string[]>> = {
+    ".env.example": parseEnvTemplate(input.envExample),
+    ".env.sample": parseEnvTemplate(input.envSample ?? null),
+  };
 
   return {
-    packageManager: manager,
+    packageManager: nodePackageManager ?? pythonPackageManager,
+    nodePackageManager,
+    pythonPackageManager,
     scripts,
-    nodeRequirement: input.nvmrc?.trim() || input.nodeVersion?.trim() || pkg?.engines?.node || null,
-    pythonRequirement: extractPythonRequirement(input.pyproject, input.pythonVersion),
-    inferredInstallCommand: inferInstallCommand(manager, Boolean(pkg), Boolean(input.pyproject), input.lockfiles),
-    inferredStartCommand,
+    nodeRequirement: pkg?.engines?.node ?? null,
+    nodePreferredVersion: input.nvmrc?.trim() || input.nodeVersion?.trim() || null,
+    pythonRequirement: extractPythonRequirement(input.pyproject),
+    pythonPreferredVersion: input.pythonVersion?.trim() || null,
+    inferredNodeInstallCommand,
+    inferredPythonInstallCommand,
+    inferredNodeStartCommand,
+    inferredInstallCommand: inferredNodeInstallCommand ?? inferredPythonInstallCommand,
+    inferredStartCommand: inferredNodeStartCommand,
     requiredEnv: [...new Set(input.requiredEnv ?? [])].sort(),
-    envExampleVars: parseEnvExample(input.envExample),
+    envExampleVars: envFileVars[".env.example"]?.length
+      ? envFileVars[".env.example"]
+      : (envFileVars[".env.sample"] ?? []),
+    envFileVars,
   };
 }

@@ -2,32 +2,36 @@
   "name": "rod",
   "version": "0.2.0",
   "private": true,
-  "description": "Repo Onboarding Doctor",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "next dev",
+    "prebuild": "npm test",
     "build": "next build",
     "start": "next start",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "workflow:inspect": "workflow inspect runs",
-    "workflow:web": "workflow web"
+    "workflow:web": "workflow web",
+    "workflow:inspect": "workflow inspect runs"
   },
   "dependencies": {
-    "@vercel/sandbox": "^1.10.2",
-    "next": "^16.0.0",
+    "@octokit/auth-app": "^8.1.0",
+    "@vercel/sandbox": "^1.2.0",
+    "next": "^16.3.0",
     "octokit": "^5.0.5",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
     "workflow": "^4.6.2"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.8.3"
-  },
-  "engines": {
-    "node": ">=22"
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "^16.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
   }
 }

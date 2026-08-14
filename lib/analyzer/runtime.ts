@@ -120,7 +120,12 @@ function comparatorInterval(token: string, kind: RuntimeKind): Interval | null {
 }
 
 function normalizeRequirement(requirement: string): string {
-  return requirement.trim().replace(/\b(?:and)\b/gi, " ").replace(/,/g, " ").replace(/\s+/g, " ");
+  return requirement
+    .trim()
+    .replace(/\bor\b/gi, " || ")
+    .replace(/\band\b/gi, " ")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ");
 }
 
 function parseRange(requirement: string | null, kind: RuntimeKind): Interval[] | null {
@@ -156,7 +161,7 @@ function parseRange(requirement: string | null, kind: RuntimeKind): Interval[] |
     if (current) parsedAlternatives.push(current);
   }
 
-  return parsedAlternatives;
+  return parsedAlternatives.length ? parsedAlternatives : null;
 }
 
 function rangesOverlap(a: string | null, b: string | null, kind: RuntimeKind): boolean | null {
@@ -254,12 +259,15 @@ export function pythonReadmeRequirementFitsRepo(
   return rangeSubsetOf(readmeRequirement, repoRequirement, "python");
 }
 
+export function selectNodeSandboxRuntimes(requirement: string | null): NodeSandboxRuntime[] {
+  if (!requirement) return ["node24", "node22", "node26"];
+  return NODE_SANDBOX_MAJORS
+    .filter((major) => nodeRequirementsOverlap(requirement, `>=${major} <${major + 1}`) === true)
+    .map((major) => `node${major}` as NodeSandboxRuntime);
+}
+
 export function selectNodeSandboxRuntime(requirement: string | null): NodeSandboxRuntime | null {
-  if (!requirement) return "node24";
-  for (const major of NODE_SANDBOX_MAJORS) {
-    if (nodeRequirementsOverlap(requirement, `>=${major} <${major + 1}`)) return `node${major}`;
-  }
-  return null;
+  return selectNodeSandboxRuntimes(requirement)[0] ?? null;
 }
 
 export function supportsPython313(requirement: string | null): boolean {
