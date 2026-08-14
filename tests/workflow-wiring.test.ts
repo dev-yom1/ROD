@@ -6,9 +6,11 @@ function source(path: string): string {
   return readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 }
 
-test("webhook starts a durable workflow instead of using Next.js after", () => {
+test("webhook starts the single durable diagnosis workflow", () => {
   const route = source("app/api/github/webhook/route.ts");
   assert.match(route, /from "workflow\/api"/);
+  assert.match(route, /workflows\/diagnose-pull-request/);
+  assert.doesNotMatch(route, /diagnose-pull-request-ordered/);
   assert.match(route, /start\(diagnosePullRequestWorkflow/);
   assert.match(route, /x-github-delivery/);
   assert.doesNotMatch(route, /\bafter\s*\(/);
@@ -32,12 +34,15 @@ test("stale retry settles an existing Workflow Check before returning", () => {
   const orchestrator = source("lib/orchestrator/diagnose-pr.ts");
   assert.match(orchestrator, /if \(initialHeadSha !== input\.headSha\)[\s\S]*obsoleteWorkflowCheckIfPresent\(/);
   assert.match(orchestrator, /obsoleteWorkflowCheckIfPresent\([\s\S]*context\.workflowRunId[\s\S]*initialHeadSha/);
+  assert.match(orchestrator, /runSandboxDiagnosis\(archive, plan, initialFacts\)/);
 });
 
-test("repository metadata reads raw GitHub content without object type assumptions", () => {
+test("repository metadata uses authenticated Octokit raw-content requests", () => {
   const repository = source("lib/github/repository.ts");
   assert.match(repository, /application\/vnd\.github\.raw\+json/);
-  assert.match(repository, /Authorization: `Bearer \$\{token\}`/);
-  assert.match(repository, /response\.status === 404/);
+  assert.match(repository, /octokit\.request\("GET \/repos\/\{owner\}\/\{repo\}\/contents\/\{path\}"/);
+  assert.match(repository, /error as \{ status\?: number \}/);
+  assert.match(repository, /\.status === 404/);
   assert.doesNotMatch(repository, /data\.type/);
+  assert.doesNotMatch(repository, /Authorization: `Bearer/);
 });
