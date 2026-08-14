@@ -37,33 +37,42 @@ export interface SandboxDiagnosisResult {
 type SandboxRuntime = "node22" | "node24" | "node26" | "python3.13";
 type ListeningSockets = Map<number, Set<string>>;
 
-function executionRequirement(kind: RuntimeKind, facts: RepoFacts): string | null {
+function repoRuntimeRequirement(kind: RuntimeKind, facts: RepoFacts): string | null {
   if (kind === "python") return facts.pythonRequirement ?? facts.pythonPreferredVersion ?? null;
   return facts.nodeRequirement ?? facts.nodePreferredVersion ?? null;
+}
+
+function readmeRuntimeRequirement(kind: RuntimeKind, plan: ReadmePlan): string | null {
+  return kind === "python" ? plan.pythonRequirement : plan.nodeRequirement;
 }
 
 function runtimeCandidates(plan: ReadmePlan, facts: RepoFacts): { kind: RuntimeKind; runtimes: SandboxRuntime[]; issue: string | null } {
   const kind = readmeRuntimeKind(plan)
     ?? (facts.pythonPackageManager && !facts.nodePackageManager ? "python" : "node");
-  const requirement = executionRequirement(kind, facts);
+  const repoRequirement = repoRuntimeRequirement(kind, facts);
+  const readmeRequirement = readmeRuntimeRequirement(kind, plan);
 
   if (kind === "python") {
-    if (!supportsPython313(requirement)) {
+    const repoSupports = supportsPython313(repoRequirement);
+    const readmeSupports = supportsPython313(readmeRequirement);
+    if (!repoSupports || !readmeSupports) {
       return {
         kind,
         runtimes: [],
-        issue: `Repository requires Python ${requirement ?? "an unsupported version"}, while ROD currently provides Python 3.13 for execution.`,
+        issue: `ROD currently provides Python 3.13, which does not satisfy the selected README requirement ${readmeRequirement ?? "(unspecified)"} and repository requirement ${repoRequirement ?? "(unspecified)"} together.`,
       };
     }
     return { kind, runtimes: ["python3.13"], issue: null };
   }
 
-  const runtimes = selectNodeSandboxRuntimes(requirement);
+  const repoRuntimes = selectNodeSandboxRuntimes(repoRequirement);
+  const readmeRuntimes = selectNodeSandboxRuntimes(readmeRequirement);
+  const runtimes = repoRuntimes.filter((runtime) => readmeRuntimes.includes(runtime));
   if (!runtimes.length) {
     return {
       kind,
       runtimes: [],
-      issue: `Repository requires Node.js ${requirement ?? "an unsupported version"}, while ROD currently provides Node.js 22, 24, and 26.`,
+      issue: `No ROD Node.js Sandbox runtime satisfies the selected README requirement ${readmeRequirement ?? "(unspecified)"} and repository requirement ${repoRequirement ?? "(unspecified)"} together. ROD currently provides Node.js 22, 24, and 26.`,
     };
   }
   return { kind, runtimes, issue: null };
@@ -88,28 +97,42 @@ async function readActualRuntimeVersion(sandbox: Sandbox, runtime: SandboxRuntim
   return null;
 }
 
+function exactVersionFits(kind: RuntimeKind, requirement: string | null, actualVersion: string): boolean | null {
+  if (!requirement) return true;
+  return kind === "python"
+    ? pythonReadmeRequirementFitsRepo(requirement, actualVersion)
+    : nodeReadmeRequirementFitsRepo(requirement, actualVersion);
+}
+
 async function verifyActualRuntime(
   sandbox: Sandbox,
   runtime: SandboxRuntime,
   kind: RuntimeKind,
+  plan: ReadmePlan,
   facts: RepoFacts,
 ): Promise<string | null> {
   const actualVersion = await readActualRuntimeVersion(sandbox, runtime);
   const runtimeName = kind === "python" ? "Python" : "Node.js";
-  const requirement = executionRequirement(kind, facts);
+  const repoRequirement = repoRuntimeRequirement(kind, facts);
+  const readmeRequirement = readmeRuntimeRequirement(kind, plan);
 
   if (!actualVersion) {
     return `ROD selected ${runtime}, but could not determine its exact ${runtimeName} version before running repository code.`;
   }
 
-  const satisfies = kind === "python"
-    ? pythonReadmeRequirementFitsRepo(requirement, actualVersion)
-    : nodeReadmeRequirementFitsRepo(requirement, actualVersion);
-  if (satisfies === true) return null;
-  if (satisfies === null) {
-    return `ROD could not safely evaluate repository ${runtimeName} requirement ${requirement ?? "(none)"} against the actual Sandbox version ${actualVersion}.`;
+  const checks = [
+    ["repository", repoRequirement, exactVersionFits(kind, repoRequirement, actualVersion)],
+    ["README", readmeRequirement, exactVersionFits(kind, readmeRequirement, actualVersion)],
+  ] as const;
+  const indeterminate = checks.find(([, requirement, result]) => requirement && result === null);
+  if (indeterminate) {
+    return `ROD could not safely evaluate the ${indeterminate[0]} ${runtimeName} requirement ${indeterminate[1]} against the actual Sandbox version ${actualVersion}.`;
   }
-  return `Repository requires ${runtimeName} ${requirement ?? "an unsupported version"}, but ${runtime} currently provides ${runtimeName} ${actualVersion}.`;
+  const failed = checks.find(([, requirement, result]) => requirement && result === false);
+  if (failed) {
+    return `The actual ${runtimeName} ${actualVersion} in ${runtime} does not satisfy the ${failed[0]} requirement ${failed[1]}.`;
+  }
+  return null;
 }
 
 async function createCompatibleSandbox(
@@ -128,7 +151,7 @@ async function createCompatibleSandbox(
       ports: exposedPorts,
       env: { CI: "1", ROD_SANDBOX: "1" },
     });
-    const issue = await verifyActualRuntime(sandbox, runtime, selection.kind, facts);
+    const issue = await verifyActualRuntime(sandbox, runtime, selection.kind, plan, facts);
     if (!issue) return { sandbox, issue: null };
     lastIssue = issue;
     await sandbox.stop().catch(() => undefined);
@@ -200,15 +223,28 @@ function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null
   return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
 }
 
+function plannedExecutableCommands(plan: ReadmePlan): string[] {
+  return plan.steps
+    .filter((step) => {
+      const parsed = parseOnboardingCommand(step.command, step.malformed);
+      return parsed.safe
+        && parsed.executable
+        && (step.role === "preparation" || step.role === "install" || step.role === "start");
+    })
+    .map((step) => step.command);
+}
+
 async function preflightRunnerTools(sandbox: Sandbox, plan: ReadmePlan, facts: RepoFacts): Promise<string | null> {
-  const commands = plan.steps.map((step) => step.command);
+  const commands = plannedExecutableCommands(plan);
   if (!plan.installCommand) {
     const fallback = inferredInstallForPlan(plan, facts);
-    if (fallback) commands.push(fallback);
+    const parsed = fallback ? parseOnboardingCommand(fallback) : null;
+    if (fallback && parsed?.safe && parsed.executable && parsed.role === "install") commands.push(fallback);
   }
   if (!plan.startCommand) {
     const fallback = inferredStartForPlan(plan, facts);
-    if (fallback) commands.push(fallback);
+    const parsed = fallback ? parseOnboardingCommand(fallback) : null;
+    if (fallback && parsed?.safe && parsed.executable && parsed.role === "start") commands.push(fallback);
   }
 
   const executables = [...new Set(commands.map(executableForCommand).filter((value): value is string => Boolean(value)))];
@@ -342,6 +378,14 @@ function observedUrlForPort(sandbox: Sandbox, port: number, exposedPorts: number
   return domain.startsWith("http://") || domain.startsWith("https://") ? domain : `https://${domain}`;
 }
 
+async function readStartExitCode(sandbox: Sandbox): Promise<number | null> {
+  const result = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "cat /tmp/rod-start.exit 2>/dev/null || true"] });
+  const raw = (await result.stdout()).trim();
+  if (!/^-?\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 async function probeObservedUrl(
   sandbox: Sandbox,
   exposedPorts: number[],
@@ -363,6 +407,7 @@ async function probeObservedUrl(
       if (localStatus < 500) return observation;
       lastServerError = observation;
     }
+    if (await readStartExitCode(sandbox) !== null) return lastServerError;
     await sandbox.runCommand("sleep", [String(PROBE_INTERVAL_MS / 1000)]);
   }
   return lastServerError;
@@ -371,12 +416,6 @@ async function probeObservedUrl(
 async function readStartLog(sandbox: Sandbox): Promise<string> {
   const result = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "tail -c 20000 /tmp/rod-start.log 2>/dev/null || true"] });
   return await result.stdout();
-}
-
-async function readStartExitCode(sandbox: Sandbox): Promise<number | null> {
-  const result = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "cat /tmp/rod-start.exit 2>/dev/null || true"] });
-  const value = Number((await result.stdout()).trim());
-  return Number.isInteger(value) ? value : null;
 }
 
 async function isStartProcessAlive(sandbox: Sandbox): Promise<boolean> {
@@ -535,7 +574,11 @@ export async function runSandboxDiagnosis(
         } else {
           startupTimedOut = startExitCode === null && await isStartProcessAlive(sandbox);
         }
-        const startSucceeded = Boolean(probe && probe.status < 500);
+        const startSucceeded = Boolean(
+          probe
+          && probe.status < 500
+          && (startExitCode === null || startExitCode === 0)
+        );
         stepResults.push({ stepId: step.id, status: startSucceeded ? "executed" : "failed" });
         afterStart = true;
       }
