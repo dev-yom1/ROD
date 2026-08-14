@@ -203,7 +203,7 @@ test("preferred runtime version does not narrow the repository supported range",
     envExample: null,
     envSample: null,
   });
-  const readme = `Requires Node.js >=22.\n\n## Development\n\`\`\`bash\nnpm install\nnpm run dev\n\`\`\``;
+  const readme = `## Development\nRequires Node.js >=22.\n\n\`\`\`bash\nnpm install\nnpm run dev\n\`\`\``;
   const findings = diagnose(readme, extractReadmePlan(readme), facts, emptyRun());
 
   assert.equal(facts.nodeRequirement, ">=22");
@@ -222,7 +222,7 @@ test("README Node 22 or 24 is a union and mismatches a Node-22-only repository",
     envExample: null,
     envSample: null,
   });
-  const readme = `Requires Node.js 22 or 24.\n\n## Development\n\`\`\`bash\nnpm install\nnpm run dev\n\`\`\``;
+  const readme = `## Development\nRequires Node.js 22 or 24.\n\n\`\`\`bash\nnpm install\nnpm run dev\n\`\`\``;
   const plan = extractReadmePlan(readme);
   assert.equal(plan.nodeRequirement, "22 || 24");
   assert(diagnose(readme, plan, facts, emptyRun()).some((finding) => finding.code === "RUNTIME_MISMATCH"));
