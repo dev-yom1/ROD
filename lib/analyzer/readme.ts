@@ -99,6 +99,17 @@ function stripLeadingEnvAssignments(command: string): string {
   }
 }
 
+function commandToolFamily(command: string): string | null {
+  const body = stripLeadingEnvAssignments(command);
+  const executable = body.match(/^([A-Za-z0-9_.+-]+)/)?.[1]?.toLowerCase() ?? null;
+  if (!executable) return null;
+  if (executable === "npx") return "npm";
+  if (executable === "pnpx") return "pnpm";
+  if (executable === "bunx") return "bun";
+  if (executable === "python" || executable === "python3" || executable === "pip" || executable === "pip3") return "pip";
+  return executable;
+}
+
 function blockedShellSyntax(command: string): boolean {
   if (/[;&|`]/.test(command) || /\$\(/.test(command) || /(?:^|\s)[<>](?:\s|$)/.test(command)) return true;
   return [
@@ -282,6 +293,41 @@ function isSetupBucket(bucket: SectionBucket): boolean {
   return /\b(?:installation|install|setup|environment|prerequisites?|requirements?|getting started|quick ?start)\b/i.test(bucket.section);
 }
 
+function installStepScore(step: ReadmeStep, terminalStart: ReadmeStep): number {
+  const install = parseOnboardingCommand(step.command, step.malformed);
+  const start = parseOnboardingCommand(terminalStart.command, terminalStart.malformed);
+  let score = 0;
+  if (install.runtime && start.runtime && install.runtime === start.runtime) score += 100;
+  if (commandToolFamily(step.command) === commandToolFamily(terminalStart.command)) score += 200;
+  return score;
+}
+
+function selectedSetupSteps(bucket: SectionBucket, terminalStart: ReadmeStep): ReadmeStep[] {
+  const installs = bucket.steps.filter((step) => step.role === "install");
+  if (installs.length <= 1) return bucket.steps;
+  const selected = installs
+    .slice()
+    .sort((a, b) => {
+      const score = installStepScore(b, terminalStart) - installStepScore(a, terminalStart);
+      if (score !== 0) return score;
+      return a.line - b.line;
+    })[0];
+  return bucket.steps.filter((step) => step.role !== "install" || step.id === selected.id);
+}
+
+function setupBucketScore(bucket: SectionBucket, terminalStart: ReadmeStep, terminal: SectionBucket): number {
+  const installs = bucket.steps.filter((step) => step.role === "install");
+  const bestInstallScore = installs.length
+    ? Math.max(...installs.map((step) => installStepScore(step, terminalStart)))
+    : 0;
+  const headingToolBonus = commandToolFamily(terminalStart.command)
+    && bucket.section?.toLowerCase().includes(commandToolFamily(terminalStart.command) ?? "")
+    ? 50
+    : 0;
+  const proximity = Math.max(0, 50 - Math.max(0, terminal.startLine - bucket.startLine));
+  return bestInstallScore + headingToolBonus + proximity;
+}
+
 function proseThroughStartFence(markdown: string, bucket: SectionBucket, terminalFence: ParsedFence): string[] {
   const lines = markdown.split("\n");
   let endLine = terminalFence.endLine;
@@ -309,13 +355,38 @@ function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: st
 
   const terminalFence = terminal.fences.find((fence) => fence.steps.some((step) => step.role === "start"))
     ?? terminal.fences[terminal.fences.length - 1];
-  const setupBuckets = buckets.filter((bucket) => (
+  const terminalStart = terminalFence.steps.find((step) => step.role === "start")
+    ?? terminal.steps.find((step) => step.role === "start");
+  if (!terminalStart) {
+    const terminalSteps = terminal.fences
+      .filter((fence) => fence.index <= terminalFence.index)
+      .flatMap((fence) => fence.steps);
+    return {
+      steps: terminalSteps,
+      text: proseThroughStartFence(markdown, terminal, terminalFence).join("\n"),
+      sections: terminal.section ? [terminal.section] : [],
+    };
+  }
+
+  const setupCandidates = buckets.filter((bucket) => (
     bucket.startLine < terminal.startLine && isSetupBucket(bucket)
   ));
+  const installBuckets = setupCandidates.filter((bucket) => bucket.steps.some((step) => step.role === "install"));
+  const selectedInstallBucket = installBuckets
+    .slice()
+    .sort((a, b) => {
+      const score = setupBucketScore(b, terminalStart, terminal) - setupBucketScore(a, terminalStart, terminal);
+      if (score !== 0) return score;
+      return b.startLine - a.startLine;
+    })[0] ?? null;
+  const setupBuckets = setupCandidates.filter((bucket) => (
+    !bucket.steps.some((step) => step.role === "install") || bucket === selectedInstallBucket
+  ));
+  const setupSteps = setupBuckets.flatMap((bucket) => selectedSetupSteps(bucket, terminalStart));
   const terminalSteps = terminal.fences
     .filter((fence) => fence.index <= terminalFence.index)
     .flatMap((fence) => fence.steps);
-  const steps = [...setupBuckets.flatMap((bucket) => bucket.steps), ...terminalSteps];
+  const steps = [...setupSteps, ...terminalSteps];
   const textParts = [
     ...setupBuckets.flatMap((bucket) => bucket.lines.map((item) => item.text)),
     ...proseThroughStartFence(markdown, terminal, terminalFence),
@@ -340,7 +411,14 @@ function extractRuntime(markdown: string, runtime: "node" | "python"): string | 
     if (/\b(?:or\s+(?:newer|later)|and\s+(?:newer|later))\b/i.test(tail) || /\+$/.test(matches[0])) {
       return `>=${matches[0].replace(/\+$/, "").replace(/^[=\s]+/, "")}`;
     }
-    if (matches.length > 1 && /\bor\b/i.test(tail)) return matches.join(" || ");
+
+    const alternatives = tail.split(/\bor\b/i);
+    if (alternatives.length > 1) {
+      const groups = alternatives.map((alternative) => (
+        [...alternative.matchAll(token)].map((match) => match[0].trim()).filter(Boolean).join(" ")
+      ));
+      if (groups.every(Boolean)) return groups.join(" || ");
+    }
     return matches.join(" ").replace(/\s+/g, " ");
   }
   return null;
