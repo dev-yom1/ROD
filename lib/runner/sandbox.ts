@@ -92,14 +92,19 @@ async function verifyActualRuntime(
   return `Repository requires ${runtimeName} ${requirement ?? "an unsupported version"}, but the selected ROD Sandbox currently provides ${runtimeName} ${actualVersion}. Setup and start were skipped.`;
 }
 
-async function runShell(sandbox: Sandbox, command: string, timeoutSeconds: number): Promise<CommandObservation> {
+async function runShell(
+  sandbox: Sandbox,
+  command: string,
+  timeoutSeconds: number,
+  observationCommand = command,
+): Promise<CommandObservation> {
   const result = await sandbox.runCommand({
     cmd: "timeout",
     args: ["--signal=TERM", "--kill-after=5s", `${timeoutSeconds}s`, "bash", "-lc", command],
     cwd: REPO_DIR,
   });
   return {
-    command,
+    command: observationCommand,
     exitCode: result.exitCode,
     stdout: await result.stdout(),
     stderr: await result.stderr(),
@@ -137,9 +142,22 @@ function pickStartCommand(plan: ReadmePlan, facts: RepoFacts): string | null {
   return null;
 }
 
-async function runReadmePreparation(sandbox: Sandbox, plan: ReadmePlan): Promise<void> {
+function normalizePreparationCommand(command: string): string {
+  return /^copy\s+/i.test(command) ? command.replace(/^copy\b/i, "cp") : command;
+}
+
+async function runReadmePreparation(sandbox: Sandbox, plan: ReadmePlan): Promise<CommandObservation[]> {
   const preparation = plan.commands.filter((command) => /^(?:cp|copy|mkdir|touch)\s+/i.test(command) && isSafeOnboardingCommand(command));
-  for (const command of preparation) await runShell(sandbox, command, PREP_TIMEOUT_SECONDS);
+  const observations: CommandObservation[] = [];
+  for (const command of preparation) {
+    observations.push(await runShell(
+      sandbox,
+      normalizePreparationCommand(command),
+      PREP_TIMEOUT_SECONDS,
+      command,
+    ));
+  }
+  return observations;
 }
 
 async function startApplication(sandbox: Sandbox, command: string): Promise<void> {
@@ -161,9 +179,48 @@ async function startApplication(sandbox: Sandbox, command: string): Promise<void
   });
 }
 
-function orderedProbePorts(exposedPorts: number[], preferredPort: number | null): number[] {
+export function extractPortsFromStartCommand(command: string | null): number[] {
+  if (!command) return [];
+  const ports = new Set<number>();
+  const patterns = [
+    /(?:^|\s)--port(?:=|\s+)(\d{2,5})(?=\s|$)/gi,
+    /(?:^|\s)-p\s+(\d{2,5})(?=\s|$)/gi,
+    /(?:^|\s)PORT=(\d{2,5})(?=\s|$)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of command.matchAll(pattern)) {
+      const port = Number(match[1]);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) ports.add(port);
+    }
+  }
+  return [...ports];
+}
+
+async function readListeningPorts(sandbox: Sandbox): Promise<number[]> {
+  const result = await sandbox.runCommand({
+    cmd: "bash",
+    args: [
+      "-lc",
+      "awk 'NR > 1 && $4 == \"0A\" { split($2, a, \":\"); print a[2] }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | while IFS= read -r hex; do printf '%d\\n' \"0x$hex\"; done | sort -n -u",
+    ],
+  });
+  if (result.exitCode !== 0) return [];
+  return (await result.stdout())
+    .split(/\s+/)
+    .map((value) => Number(value))
+    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65535);
+}
+
+function orderedProbePorts(
+  exposedPorts: number[],
+  preferredPort: number | null,
+  commandPorts: number[],
+  listeningPorts: number[],
+): number[] {
   return [...new Set([
-    ...(preferredPort && exposedPorts.includes(preferredPort) ? [preferredPort] : []),
+    ...(preferredPort ? [preferredPort] : []),
+    ...commandPorts,
+    ...listeningPorts,
     ...exposedPorts,
   ])];
 }
@@ -186,38 +243,35 @@ async function probeLocalHttpStatus(sandbox: Sandbox, port: number): Promise<num
   return match ? Number(match[1]) : null;
 }
 
+function observedUrlForPort(sandbox: Sandbox, port: number, exposedPorts: number[]): string {
+  if (!exposedPorts.includes(port)) return `http://localhost:${port}`;
+  const domain = sandbox.domain(port);
+  return domain.startsWith("http://") || domain.startsWith("https://") ? domain : `https://${domain}`;
+}
+
 async function probeObservedUrl(
   sandbox: Sandbox,
   exposedPorts: number[],
   preferredPort: number | null,
+  startCommand: string,
 ): Promise<{ port: number; url: string; status: number } | null> {
   const deadline = Date.now() + PROBE_TIMEOUT_MS;
-  const orderedPorts = orderedProbePorts(exposedPorts, preferredPort);
+  const commandPorts = extractPortsFromStartCommand(startCommand);
   let lastServerError: { port: number; url: string; status: number } | null = null;
   while (Date.now() < deadline) {
+    const listeningPorts = await readListeningPorts(sandbox);
+    const orderedPorts = orderedProbePorts(exposedPorts, preferredPort, commandPorts, listeningPorts);
+
     for (const port of orderedPorts) {
-      const domain = sandbox.domain(port);
-      const url = domain.startsWith("http://") || domain.startsWith("https://") ? domain : `https://${domain}`;
-
       const localStatus = await probeLocalHttpStatus(sandbox, port);
-      if (localStatus !== null) {
-        const observation = { port, url, status: localStatus };
-        if (localStatus < 500) return observation;
-        lastServerError = observation;
-        continue;
-      }
-
-      try {
-        const response = await fetch(url, {
-          redirect: "manual",
-          signal: AbortSignal.timeout(3_000),
-        });
-        const observation = { port, url, status: response.status };
-        if (response.status < 500) return observation;
-        lastServerError = observation;
-      } catch {
-        // Public ingress can lag behind process startup; retry until the observation budget expires.
-      }
+      if (localStatus === null) continue;
+      const observation = {
+        port,
+        url: observedUrlForPort(sandbox, port, exposedPorts),
+        status: localStatus,
+      };
+      if (localStatus < 500) return observation;
+      lastServerError = observation;
     }
     await sandbox.runCommand("sleep", [String(PROBE_INTERVAL_MS / 1000)]);
   }
@@ -240,8 +294,10 @@ async function isStartProcessAlive(sandbox: Sandbox): Promise<boolean> {
   return result.exitCode === 0;
 }
 
-function emptyExecution(runtimeIssue: string | null): ExecutionObservation {
+function emptyExecution(runtimeIssue: string | null, unsupportedCommands: string[]): ExecutionObservation {
   return {
+    preparation: [],
+    unsupportedCommands,
     install: null,
     startCommand: null,
     startLog: "",
@@ -259,9 +315,12 @@ export async function runSandboxDiagnosis(
   facts: RepoFacts,
 ): Promise<SandboxDiagnosisResult> {
   const selection = chooseRuntime(facts);
+  const unsupportedCommands = plan.commands.filter((command) => !isSafeOnboardingCommand(command));
+  const startCommand = pickStartCommand(plan, facts);
   const exposedPorts = [...new Set([
     ...COMMON_PORTS,
     ...(plan.expectedPort && plan.expectedPort > 0 && plan.expectedPort <= 65535 ? [plan.expectedPort] : []),
+    ...extractPortsFromStartCommand(startCommand),
   ])];
 
   // Major runtime selection is only a candidate. The exact Sandbox version is verified below before repository code runs.
@@ -291,15 +350,14 @@ export async function runSandboxDiagnosis(
 
     const requiredEnv = await detectRequiredEnv(sandbox);
     if (actualRuntimeIssue) {
-      return { requiredEnv, execution: emptyExecution(actualRuntimeIssue) };
+      return { requiredEnv, execution: emptyExecution(actualRuntimeIssue, unsupportedCommands) };
     }
 
-    await runReadmePreparation(sandbox, plan);
+    const preparation = await runReadmePreparation(sandbox, plan);
     await preparePackageManager(sandbox, facts);
 
     const installCommand = pickInstallCommand(plan, facts);
     const install = installCommand ? await runShell(sandbox, installCommand, INSTALL_TIMEOUT_SECONDS) : null;
-    const startCommand = pickStartCommand(plan, facts);
 
     let startLog = "";
     let observedPort: number | null = null;
@@ -309,7 +367,7 @@ export async function runSandboxDiagnosis(
 
     if (startCommand && (!install || (!install.timedOut && install.exitCode === 0))) {
       await startApplication(sandbox, startCommand);
-      const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort);
+      const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort, startCommand);
       startLog = await readStartLog(sandbox);
       if (probe) {
         observedPort = probe.port;
@@ -323,6 +381,8 @@ export async function runSandboxDiagnosis(
     return {
       requiredEnv,
       execution: {
+        preparation,
+        unsupportedCommands,
         install,
         startCommand,
         startLog,
