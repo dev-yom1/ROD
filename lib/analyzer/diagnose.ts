@@ -2,7 +2,7 @@ import { npmScriptReferencedByCommand } from "./readme";
 import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
 import type { CommandObservation, ExecutionObservation, Finding, ReadmePlan, RepoFacts } from "./types";
 
-const ENV_COPY_COMMAND = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?(?:\s|$)/i;
+const ENV_COPY_COMMAND = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?\s*$/i;
 
 function excerpt(text: string, max = 500): string {
   const normalized = text.trim();
@@ -127,13 +127,13 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     }
   }
 
-  const envExamplePreparationFailed = run.preparation.some((command) => (
-    ENV_COPY_COMMAND.test(command.command) && commandFailed(command)
+  const envExamplePreparationSucceeded = run.preparation.some((command) => (
+    ENV_COPY_COMMAND.test(command.command) && !commandFailed(command)
   ));
   const documentedEnv = new Set(facts.envExampleVars);
   for (const name of facts.requiredEnv) {
     const namedInReadme = readme.includes(name);
-    const coveredByExample = plan.copiesEnvExample && !envExamplePreparationFailed && documentedEnv.has(name);
+    const coveredByExample = envExamplePreparationSucceeded && documentedEnv.has(name);
     if (!namedInReadme && !coveredByExample) {
       findings.push({
         code: "ENV_MISSING",
