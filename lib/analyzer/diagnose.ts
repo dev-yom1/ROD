@@ -1,7 +1,12 @@
-import { npmScriptReferencedByCommand } from "./readme";
+import {
+  npmScriptReferencedByCommand,
+  parseOnboardingCommand,
+  readmeRuntimeKind,
+} from "./readme";
 import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
 import type {
   CommandObservation,
+  EnvTemplateName,
   ExecutionObservation,
   Finding,
   ReadmePlan,
@@ -10,7 +15,7 @@ import type {
   StepResult,
 } from "./types";
 
-const ENV_COPY_COMMAND = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?\s*$/i;
+const LEGACY_ENV_COPY = /^(?:cp|copy)\s+(\.env(?:\.example|\.sample))\s+\.env(?:\.local|\.development\.local)?\s*$/i;
 
 function excerpt(text: string, max = 500): string {
   const normalized = text.trim();
@@ -33,7 +38,7 @@ function unreproducedSteps(plan: ReadmePlan, run: ExecutionObservation): ReadmeS
       const result = resultMap.get(step.id);
       if (!result) return true;
       return result.status === "skipped"
-        && (result.reason === "unsafe" || result.reason === "unsupported" || result.reason === "after-start");
+        && ["unsafe", "unsupported", "malformed", "after-start"].includes(result.reason ?? "");
     });
   }
 
@@ -43,16 +48,27 @@ function unreproducedSteps(plan: ReadmePlan, run: ExecutionObservation): ReadmeS
   return plan.steps.filter((step) => !reproduced.has(step.command));
 }
 
-function successfulEnvCopy(plan: ReadmePlan, run: ExecutionObservation): boolean {
+function successfulEnvCopySources(plan: ReadmePlan, run: ExecutionObservation): Set<EnvTemplateName> {
+  const sources = new Set<EnvTemplateName>();
   const resultMap = stepResultById(run);
   if (resultMap) {
-    return plan.steps.some((step) => {
-      if (!ENV_COPY_COMMAND.test(step.command)) return false;
+    for (const step of plan.steps) {
+      const parsed = parseOnboardingCommand(step.command, step.malformed);
+      if (!parsed.envCopySource) continue;
       const result = resultMap.get(step.id);
-      return result?.status === "executed" && Boolean(result.observation && !commandFailed(result.observation));
-    });
+      if (result?.status === "executed" && result.observation && !commandFailed(result.observation)) {
+        sources.add(parsed.envCopySource);
+      }
+    }
+    return sources;
   }
-  return run.preparation.some((command) => ENV_COPY_COMMAND.test(command.command) && !commandFailed(command));
+
+  for (const command of run.preparation) {
+    if (commandFailed(command)) continue;
+    const match = command.command.match(LEGACY_ENV_COPY);
+    if (match) sources.add(match[1].toLowerCase() as EnvTemplateName);
+  }
+  return sources;
 }
 
 function pushRuntimeFinding(
@@ -88,11 +104,28 @@ function preexistingExpectedPortConflict(plan: ReadmePlan, run: ExecutionObserva
   if (!run.preexistingPorts?.length || run.observedPort !== null) return null;
   if (plan.expectedPort && run.preexistingPorts.includes(plan.expectedPort)) return plan.expectedPort;
   if (run.startCommand) {
-    const match = run.startCommand.match(/(?:--port(?:=|\s+)|-p\s+|PORT=)(\d{2,5})\b/i);
-    const hintedPort = match ? Number(match[1]) : null;
-    if (hintedPort && run.preexistingPorts.includes(hintedPort)) return hintedPort;
+    const hinted = parseOnboardingCommand(run.startCommand).portHints[0] ?? null;
+    if (hinted && run.preexistingPorts.includes(hinted)) return hinted;
   }
   return null;
+}
+
+function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  const runtime = readmeRuntimeKind(plan);
+  if (runtime === "python") return facts.inferredPythonInstallCommand ?? facts.inferredInstallCommand;
+  if (runtime === "node") return facts.inferredNodeInstallCommand ?? facts.inferredInstallCommand;
+  return facts.inferredInstallCommand;
+}
+
+function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  const runtime = readmeRuntimeKind(plan);
+  if (runtime === "python") return null;
+  return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+}
+
+function readmeMentionsEnv(readme: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^A-Z0-9_])${escaped}(?![A-Z0-9_])`, "m").test(readme);
 }
 
 export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run: ExecutionObservation): Finding[] {
@@ -122,26 +155,37 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       suggestion: "Treat this as a ROD runner limitation, not a repository setup failure.",
     });
   }
+  if (run.runnerIssue) {
+    findings.push({
+      code: "RUNNER_TOOL_UNSUPPORTED",
+      severity: "warning",
+      title: "ROD runner is missing a required onboarding tool",
+      detail: run.runnerIssue,
+      suggestion: "Treat this as a ROD runner capability gap rather than a broken repository command.",
+    });
+  }
 
-  if (facts.inferredInstallCommand && !plan.installCommand) {
+  const inferredInstall = inferredInstallForPlan(plan, facts);
+  const inferredStart = inferredStartForPlan(plan, facts);
+  if (inferredInstall && !plan.installCommand) {
     findings.push({
       code: "INSTALL_STEP_MISSING",
       severity: "warning",
       title: "Dependency installation is missing from the README",
-      detail: `ROD inferred that dependencies must be installed with ${facts.inferredInstallCommand}, but found no install step in the selected onboarding flow.`,
+      detail: "ROD inferred that dependency installation is required, but found no install step in the selected onboarding flow.",
       suggestion: "Document the dependency installation command before the development/start command.",
-      evidence: [facts.inferredInstallCommand],
+      evidence: [inferredInstall],
     });
   }
 
-  if (facts.inferredStartCommand && !plan.startCommand) {
+  if (inferredStart && !plan.startCommand) {
     findings.push({
       code: "START_STEP_MISSING",
       severity: "warning",
       title: "Application start command is missing from the README",
       detail: "ROD inferred a start command from repository configuration, but the selected onboarding flow does not tell a new contributor how to start the application.",
       suggestion: "Document the intended development/start command in the onboarding flow.",
-      evidence: [facts.inferredStartCommand],
+      evidence: [inferredStart],
     });
   }
 
@@ -159,18 +203,20 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     }
   }
 
-  // Runtime incompatibility means repository commands were intentionally not attempted. Do not
-  // convert that one runner limitation into command/env execution findings.
-  if (run.runtimeIssue) return findings;
+  if (run.runtimeIssue || run.runnerIssue) return findings;
 
   for (const step of unreproducedSteps(plan, run)) {
     findings.push({
       code: "RUNNER_COMMAND_UNSUPPORTED",
       severity: "warning",
-      title: "README command was not reproduced",
-      detail: "ROD did not reproduce this occurrence in the selected onboarding flow. Inferred fallback commands are diagnostic-only and never count as reproducing a documented step.",
+      title: step.malformed ? "README shell command is incomplete" : "README command was not reproduced",
+      detail: step.malformed
+        ? "The selected onboarding flow contains an unfinished shell continuation, so ROD did not repair or execute it."
+        : "ROD did not reproduce this occurrence in the selected onboarding flow. Inferred fallback commands are diagnostic-only and never count as reproducing a documented step.",
       evidence: [step.command],
-      suggestion: "Teach ROD how to reproduce this step explicitly, or rewrite the onboarding flow using runner-supported commands.",
+      suggestion: step.malformed
+        ? "Complete the multiline shell command in the README."
+        : "Teach ROD how to reproduce this step explicitly, or rewrite the onboarding flow using runner-supported commands.",
     });
   }
 
@@ -188,18 +234,21 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     });
   }
 
-  const envExamplePreparationSucceeded = successfulEnvCopy(plan, run);
-  const documentedEnv = new Set(facts.envExampleVars);
+  const successfulCopySources = successfulEnvCopySources(plan, run);
   for (const name of facts.requiredEnv) {
-    const namedInReadme = readme.includes(name);
-    const coveredByExample = envExamplePreparationSucceeded && documentedEnv.has(name);
+    const namedInReadme = readmeMentionsEnv(readme, name);
+    const coveredByExample = [...successfulCopySources].some((source) => {
+      const vars = facts.envFileVars?.[source]
+        ?? (source === ".env.example" ? facts.envExampleVars : []);
+      return vars.includes(name);
+    });
     if (!namedInReadme && !coveredByExample) {
       findings.push({
         code: "ENV_MISSING",
         severity: "warning",
         title: `Environment variable ${name} is not documented`,
-        detail: `Source code references ${name}, but the README does not mention it and a successful documented .env example flow did not cover it.`,
-        suggestion: `Document ${name} or add it to .env.example and tell users to copy that file.`,
+        detail: `Source code references ${name}, but the README does not mention it and a successfully copied env template did not contain it.`,
+        suggestion: `Document ${name} or add it to the env template that the README actually tells users to copy.`,
       });
     }
   }
@@ -231,12 +280,12 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       code: "RUNNER_PREEXISTING_LISTENER",
       severity: "warning",
       title: "Expected startup port was already in use before the start command",
-      detail: `Port ${preexistingConflict} was already listening immediately before ROD launched the documented start command, so that listener was excluded from startup success detection.`,
+      detail: `Port ${preexistingConflict} was already listening immediately before ROD launched the documented start command. ROD requires a new listener or a listener that disappears and is rebound after start.`,
       suggestion: "Ensure install/preparation steps do not leave a background server running on the application port.",
     });
   }
 
-  if (!run.runtimeIssue && run.startCommand && !installBlockedStartup) {
+  if (run.startCommand && !installBlockedStartup) {
     if (run.startupTimedOut) {
       findings.push({
         code: "RUNNER_TIMEOUT",
@@ -246,15 +295,18 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
         evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Treat this run as inconclusive or move the diagnosis to a longer-lived durable runner before changing the README.",
       });
-    } else if (preexistingConflict === null && (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500)) {
+    } else if (run.observedPort === null || run.httpStatus === null || run.httpStatus >= 500) {
+      const exited = run.startExitCode !== null && run.startExitCode !== undefined
+        ? ` The start process exited with code ${run.startExitCode}.`
+        : "";
       const responseDetail = run.httpStatus === null
-        ? "No HTTP response was received before the start process exited or became unusable."
+        ? "No usable new HTTP response was observed."
         : `The probed application endpoint returned HTTP ${run.httpStatus}.`;
       findings.push({
         code: "COMMAND_BROKEN",
         severity: "error",
         title: "Development server did not become reachable",
-        detail: `ROD launched the selected start command, but a usable new HTTP endpoint was not observed. ${responseDetail}`,
+        detail: `ROD launched the selected start command, but it did not produce a usable application endpoint.${exited} ${responseDetail}`,
         evidence: [run.startCommand, run.startLog ? excerpt(run.startLog) : ""].filter(Boolean),
         suggestion: "Verify the README start command and document any required environment variables or prerequisite services.",
       });
