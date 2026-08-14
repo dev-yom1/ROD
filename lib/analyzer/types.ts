@@ -1,8 +1,11 @@
 export type FindingCode =
   | "ENV_MISSING"
   | "INSTALL_STEP_MISSING"
+  | "START_STEP_MISSING"
   | "INSTALL_BROKEN"
+  | "PREPARATION_BROKEN"
   | "COMMAND_BROKEN"
+  | "RUNNER_COMMAND_UNSUPPORTED"
   | "RUNTIME_UNDOCUMENTED"
   | "RUNTIME_MISMATCH"
   | "RUNNER_RUNTIME_UNSUPPORTED"
@@ -55,6 +58,8 @@ export interface CommandObservation {
 }
 
 export interface ExecutionObservation {
+  preparation: CommandObservation[];
+  unsupportedCommands: string[];
   install: CommandObservation | null;
   startCommand: string | null;
   startLog: string;
