@@ -13,6 +13,13 @@ function commandFailed(command: CommandObservation): boolean {
   return command.timedOut || command.exitCode !== 0;
 }
 
+function unreproducedReadmeCommands(plan: ReadmePlan, run: ExecutionObservation): string[] {
+  const reproduced = new Set(run.preparation.map((command) => command.command));
+  if (plan.installCommand && run.install?.command === plan.installCommand) reproduced.add(plan.installCommand);
+  if (plan.startCommand && run.startCommand === plan.startCommand) reproduced.add(plan.startCommand);
+  return plan.commands.filter((command) => !reproduced.has(command));
+}
+
 function pushRuntimeFinding(
   findings: Finding[],
   runtime: "Node.js" | "Python",
@@ -90,13 +97,17 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     });
   }
 
-  for (const command of run.unsupportedCommands) {
+  const unreproducedCommands = new Set([
+    ...run.unsupportedCommands,
+    ...unreproducedReadmeCommands(plan, run),
+  ]);
+  for (const command of unreproducedCommands) {
     findings.push({
       code: "RUNNER_COMMAND_UNSUPPORTED",
       severity: "warning",
-      title: "README command could not be reproduced safely",
-      detail: `The README documents \`${command}\`, but ROD's isolated runner does not execute this shell form. Any inferred fallback command is used only to gather diagnostic signal and does not count as reproducing the documented onboarding flow.`,
-      suggestion: "Split the onboarding step into supported commands, or extend ROD's runner with a safe explicit implementation for this command form.",
+      title: "README command was not reproduced",
+      detail: `The README documents \`${command}\`, but ROD did not reproduce that step as preparation, dependency installation, or application startup. Any inferred fallback command is diagnostic-only and does not count as reproducing the documented onboarding flow.`,
+      suggestion: "Teach ROD how to reproduce this step explicitly, or rewrite the onboarding flow using runner-supported preparation/install/start commands.",
     });
   }
 
