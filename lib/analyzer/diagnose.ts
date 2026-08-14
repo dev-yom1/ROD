@@ -146,6 +146,17 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
     pythonReadmeRequirementFitsRepo(facts.pythonRequirement, plan.pythonRequirement),
   );
 
+  if (plan.flowIssue) {
+    findings.push({
+      code: "FLOW_AMBIGUOUS",
+      severity: "warning",
+      title: "README onboarding flow is ambiguous",
+      detail: plan.flowIssue,
+      suggestion: "Separate alternative setup/start paths into clearly labeled sections or document one canonical onboarding path.",
+    });
+    return findings;
+  }
+
   if (run.runtimeIssue) {
     findings.push({
       code: "RUNNER_RUNTIME_UNSUPPORTED",
@@ -327,13 +338,21 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
       detail: `README points to port ${plan.expectedPort}, but the HTTP endpoint ROD reached was on port ${observedPort}.`,
       suggestion: `Change the README URL to use port ${observedPort}, or configure the app to use ${plan.expectedPort}.`,
     });
-  } else if (observedPort && !plan.expectedPort) {
+  } else if (observedPort && !plan.expectedPort && !plan.expectedUrl) {
     findings.push({
       code: "START_URL_UNDOCUMENTED",
       severity: "info",
       title: "Startup URL is not documented",
-      detail: `ROD reached the app on port ${observedPort}, but the selected onboarding flow does not provide a localhost URL with a port.`,
+      detail: `ROD reached the app on port ${observedPort}, but the selected onboarding flow does not provide a localhost URL.`,
       suggestion: `Add a line such as http://localhost:${observedPort} after the start command.`,
+    });
+  } else if (observedPort && !plan.expectedPort && plan.expectedUrl) {
+    findings.push({
+      code: "START_PORT_UNDOCUMENTED",
+      severity: "info",
+      title: "Startup port is not documented",
+      detail: `The selected onboarding flow documents ${plan.expectedUrl}, but omits a port while ROD reached the app on port ${observedPort}.`,
+      suggestion: `Document the actual development URL including port ${observedPort}.`,
     });
   }
 
