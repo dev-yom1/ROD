@@ -120,7 +120,7 @@ function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | nu
 function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
   const runtime = readmeRuntimeKind(plan);
   if (runtime === "python") return null;
-  if (runtime === "node") return facts.inferredNodeStartCommand ?? null;
+  if (runtime === "node") return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
   return facts.inferredStartCommand;
 }
 
