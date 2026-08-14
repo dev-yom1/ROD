@@ -1,7 +1,7 @@
 import { start } from "workflow/api";
 import { githubConfig } from "../../../../lib/config";
 import { verifyGitHubSignature } from "../../../../lib/github/signature";
-import { diagnosePullRequestWorkflow } from "../../../../workflows/diagnose-pull-request-ordered";
+import { diagnosePullRequestWorkflow } from "../../../../workflows/diagnose-pull-request";
 
 export const runtime = "nodejs";
 
