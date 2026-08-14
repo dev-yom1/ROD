@@ -65,9 +65,6 @@ export async function diagnosePullRequest(
   const base = splitRepository(input.baseRepository);
   const source = splitRepository(input.sourceRepository);
 
-  // A retry may begin after this Workflow already created a Check Run on an older SHA.
-  // If the PR moved, settle that existing Check before returning superseded so it cannot
-  // remain in_progress forever.
   const initialHeadSha = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -113,6 +110,7 @@ export async function diagnosePullRequest(
     pythonVersion: metadata.pythonVersion,
     lockfiles: metadata.lockfiles,
     envExample: metadata.envExample,
+    envSample: metadata.envSample,
   });
 
   const archive = await downloadRepositoryArchive(
@@ -122,8 +120,6 @@ export async function diagnosePullRequest(
     input.headSha,
   );
 
-  // Archive download is cheap compared with starting an isolated runtime. Re-check
-  // immediately before Sandbox allocation so queued/slow obsolete runs exit here.
   const headBeforeSandbox = await getCurrentPullHeadSha(
     octokit,
     base.owner,
@@ -150,6 +146,7 @@ export async function diagnosePullRequest(
     pythonVersion: metadata.pythonVersion,
     lockfiles: metadata.lockfiles,
     envExample: metadata.envExample,
+    envSample: metadata.envSample,
     requiredEnv: sandboxResult.requiredEnv,
   });
   const findings = diagnose(metadata.readme, plan, facts, sandboxResult.execution);
