@@ -112,15 +112,16 @@ function preexistingExpectedPortConflict(plan: ReadmePlan, run: ExecutionObserva
 
 function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
   const runtime = readmeRuntimeKind(plan);
-  if (runtime === "python") return facts.inferredPythonInstallCommand ?? facts.inferredInstallCommand;
-  if (runtime === "node") return facts.inferredNodeInstallCommand ?? facts.inferredInstallCommand;
+  if (runtime === "python") return facts.inferredPythonInstallCommand ?? null;
+  if (runtime === "node") return facts.inferredNodeInstallCommand ?? null;
   return facts.inferredInstallCommand;
 }
 
 function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
   const runtime = readmeRuntimeKind(plan);
   if (runtime === "python") return null;
-  return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  if (runtime === "node") return facts.inferredNodeStartCommand ?? null;
+  return facts.inferredStartCommand;
 }
 
 function readmeMentionsEnv(readme: string, name: string): boolean {
@@ -246,8 +247,9 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
   }
 
   const successfulCopySources = successfulEnvCopySources(plan, run);
+  const onboardingText = plan.flowText ?? readme;
   for (const name of facts.requiredEnv) {
-    const namedInReadme = readmeMentionsEnv(readme, name);
+    const namedInReadme = readmeMentionsEnv(onboardingText, name);
     const coveredByExample = [...successfulCopySources].some((source) => {
       const vars = facts.envFileVars?.[source]
         ?? (source === ".env.example" ? facts.envExampleVars : []);
@@ -258,8 +260,8 @@ export function diagnose(readme: string, plan: ReadmePlan, facts: RepoFacts, run
         code: "ENV_MISSING",
         severity: "warning",
         title: `Environment variable ${name} is not documented`,
-        detail: `Source code references ${name}, but the README does not mention it and a successfully copied env template did not contain it.`,
-        suggestion: `Document ${name} or add it to the env template that the README actually tells users to copy.`,
+        detail: `Source code references ${name}, but the selected onboarding flow does not mention it and a successfully copied env template did not contain it.`,
+        suggestion: `Document ${name} in the local onboarding flow or add it to the env template that the README actually tells users to copy.`,
       });
     }
   }
