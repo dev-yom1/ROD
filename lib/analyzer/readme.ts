@@ -41,6 +41,7 @@ type SelectedFlow = {
   steps: ReadmeStep[];
   text: string;
   terminalText: string;
+  terminalAfterText: string;
   sections: string[];
   issue: string | null;
 };
@@ -146,7 +147,11 @@ function wrappedNodeRole(body: string): ReadmeStepRole | null {
   const framework = wrapped[1].toLowerCase();
   const subcommand = wrapped[2]?.toLowerCase() ?? null;
   if (framework === "next") return subcommand === "dev" || subcommand === "start" ? "start" : "other";
-  if (framework === "vite") return subcommand === null || subcommand === "dev" || subcommand === "serve" ? "start" : "other";
+  if (framework === "vite") {
+    return subcommand === null || subcommand === "dev" || subcommand === "serve" || subcommand.startsWith("-")
+      ? "start"
+      : "other";
+  }
   return "other";
 }
 
@@ -172,9 +177,7 @@ export function parseOnboardingCommand(command: string, malformed = false): Pars
     return { role: "preparation", safe: true, executable: true, runtime: null, envCopySource: null, portHints: hints };
   }
 
-  const nodeStart = [
-    /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start)(?:\s|$)/i,
-  ].some((pattern) => pattern.test(body));
+  const nodeStart = /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start)(?:\s|$)/i.test(body);
   if (nodeStart) {
     return { role: "start", safe: true, executable: true, runtime: "node", envCopySource: null, portHints: hints };
   }
@@ -297,6 +300,13 @@ function parseSections(markdown: string): SectionBucket[] {
   return buckets.filter((bucket) => bucket.steps.length > 0);
 }
 
+function terminalSectionPriority(section: string | null): number {
+  if (!section) return 1;
+  if (/\b(?:tests?|testing|build|debug(?:ging)?|troubleshoot(?:ing)?|production|deploy(?:ment)?|examples?)\b/i.test(section)) return 0;
+  if (/\b(?:development|develop|run|serve|local|quick ?start|getting started)\b/i.test(section)) return 3;
+  return 1;
+}
+
 function sectionBonus(section: string | null): number {
   if (!section) return 0;
   if (/\b(?:development|develop|run|serve|local|quick ?start|getting started)\b/i.test(section)) return 30;
@@ -307,7 +317,7 @@ function sectionBonus(section: string | null): number {
 function startBucketScore(bucket: SectionBucket): number {
   const starts = bucket.steps.filter((step) => step.role === "start").length;
   const installs = bucket.steps.filter((step) => step.role === "install").length;
-  return starts * 100 + installs * 10 + sectionBonus(bucket.section);
+  return installs * 10 + starts + sectionBonus(bucket.section);
 }
 
 function isSetupBucket(bucket: SectionBucket): boolean {
@@ -326,6 +336,22 @@ function explicitVariantFamily(bucket: SectionBucket): string | null {
   return null;
 }
 
+function ambiguousInstallFamilies(bucket: SectionBucket): RuntimeKind | null {
+  const byRuntime = new Map<RuntimeKind, Set<string>>();
+  for (const step of bucket.steps.filter((candidate) => candidate.role === "install")) {
+    const parsed = parseOnboardingCommand(step.command, step.malformed);
+    const family = commandToolFamily(step.command);
+    if (!parsed.runtime || !family) continue;
+    const families = byRuntime.get(parsed.runtime) ?? new Set<string>();
+    families.add(family);
+    byRuntime.set(parsed.runtime, families);
+  }
+  for (const [runtime, families] of byRuntime) {
+    if (families.size > 1) return runtime;
+  }
+  return null;
+}
+
 function proseThroughStartFence(markdown: string, bucket: SectionBucket, terminalFence: ParsedFence): string[] {
   const lines = markdown.split("\n");
   let endLine = terminalFence.endLine;
@@ -337,6 +363,17 @@ function proseThroughStartFence(markdown: string, bucket: SectionBucket, termina
   return bucket.lines.filter((item) => item.line <= endLine).map((item) => item.text);
 }
 
+function proseAfterStartFence(markdown: string, bucket: SectionBucket, terminalFence: ParsedFence): string[] {
+  const lines = markdown.split("\n");
+  const result: string[] = [];
+  for (let lineNumber = terminalFence.endLine + 1; lineNumber <= bucket.endLine; lineNumber += 1) {
+    const text = lines[lineNumber - 1] ?? "";
+    if (HEADING.test(text) || FENCE_START.test(text)) break;
+    result.push(text);
+  }
+  return result;
+}
+
 function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const buckets = parseSections(markdown);
   if (!buckets.length) return null;
@@ -345,6 +382,8 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const terminal = (startBuckets.length ? startBuckets : buckets)
     .slice()
     .sort((a, b) => {
+      const priority = terminalSectionPriority(b.section) - terminalSectionPriority(a.section);
+      if (priority !== 0) return priority;
       const score = startBucketScore(b) - startBucketScore(a);
       if (score !== 0) return score;
       return a.startLine - b.startLine;
@@ -356,6 +395,7 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const terminalStarts = terminalFence.steps.filter((step) => step.role === "start");
   const terminalStart = terminalStarts[0] ?? terminal.steps.find((step) => step.role === "start") ?? null;
   const terminalText = proseThroughStartFence(markdown, terminal, terminalFence).join("\n");
+  const terminalAfterText = proseAfterStartFence(markdown, terminal, terminalFence).join("\n");
 
   if (!terminalStart) {
     const terminalSteps = terminal.fences
@@ -365,6 +405,7 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
       steps: terminalSteps,
       text: terminalText,
       terminalText,
+      terminalAfterText,
       sections: terminal.section ? [terminal.section] : [],
       issue: null,
     };
@@ -386,6 +427,14 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
     } else {
       flowIssue = `ROD found multiple explicit setup variants before the selected start flow and could not choose exactly one for ${terminalFamily ?? "the start command"}.`;
     }
+  }
+
+  const genericAmbiguity = setupCandidates.find((bucket) => (
+    explicitVariantFamily(bucket) === null && ambiguousInstallFamilies(bucket) !== null
+  ));
+  if (genericAmbiguity) {
+    const runtime = ambiguousInstallFamilies(genericAmbiguity);
+    flowIssue = `ROD found multiple ${runtime ?? "package-manager"} installation tool families inside the same setup section and cannot tell whether they are alternatives or cumulative steps.`;
   }
 
   if (startFences.length > 1) {
@@ -411,7 +460,7 @@ function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const sections = [...setupBuckets, terminal]
     .map((bucket) => bucket.section)
     .filter((section): section is string => Boolean(section));
-  return { steps, text: textParts.join("\n"), terminalText, sections, issue: flowIssue };
+  return { steps, text: textParts.join("\n"), terminalText, terminalAfterText, sections, issue: flowIssue };
 }
 
 function extractRuntime(markdown: string, runtime: "node" | "python"): string | null {
@@ -428,6 +477,12 @@ function extractRuntime(markdown: string, runtime: "node" | "python"): string | 
     if (/\b(?:or\s+(?:newer|later)|and\s+(?:newer|later))\b/i.test(tail) || /\+$/.test(matches[0])) {
       return `>=${matches[0].replace(/\+$/, "").replace(/^[=\s]+/, "")}`;
     }
+
+    const bareList = matches.length > 1
+      && /,/.test(tail)
+      && /\bor\b/i.test(tail)
+      && matches.every((match) => /^v?\d+(?:\.(?:\d+|x|\*)){0,2}$/.test(match));
+    if (bareList) return matches.map((match) => match.replace(/^v/i, "")).join(" || ");
 
     const alternatives = tail.split(/\s*(?:\|\||\bor\b)\s*/i);
     if (alternatives.length > 1) {
@@ -448,7 +503,9 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
   const startStep = steps.find((step) => step.role === "start") ?? null;
   const flowText = flow?.text ?? markdown;
   const terminalText = flow?.terminalText ?? flowText;
-  const urlMatch = terminalText.match(/https?:\/\/(?:localhost|127\.0\.0\.1)(?::(\d{2,5}))?(?:\/[^\s)`]*)?/i);
+  const terminalAfterText = flow?.terminalAfterText ?? "";
+  const urlPattern = /https?:\/\/(?:localhost|127\.0\.0\.1)(?::(\d{2,5}))?(?:\/[^\s)`]*)?/i;
+  const urlMatch = terminalAfterText.match(urlPattern) ?? terminalText.match(urlPattern);
   const expectedUrl = urlMatch?.[0] ?? null;
   const expectedPort = urlMatch?.[1] ? Number(urlMatch[1]) : null;
 
@@ -469,20 +526,32 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
   };
 }
 
+export function readmeRuntimeKinds(plan: ReadmePlan): RuntimeKind[] {
+  const kinds = new Set<RuntimeKind>();
+  for (const step of plan.steps) {
+    if (step.role !== "install" && step.role !== "start") continue;
+    const runtime = parseOnboardingCommand(step.command, step.malformed).runtime;
+    if (runtime) kinds.add(runtime);
+  }
+  return [...kinds];
+}
+
 export function readmeRuntimeKind(plan: ReadmePlan): RuntimeKind | null {
   const start = plan.steps.find((step) => step.role === "start");
   const startRuntime = start ? parseOnboardingCommand(start.command, start.malformed).runtime : null;
   if (startRuntime) return startRuntime;
-  const install = plan.steps.find((step) => step.role === "install");
-  return install ? parseOnboardingCommand(install.command, install.malformed).runtime : null;
+  const kinds = readmeRuntimeKinds(plan);
+  return kinds.length === 1 ? kinds[0] : null;
 }
 
 export function npmScriptReferencedByCommand(command: string): string | null {
+  const parsed = parseOnboardingCommand(command);
+  if (parsed.runtime !== "node" || parsed.role === "install" || parsed.role === "preparation") return null;
   const body = stripLeadingEnvAssignments(command);
   const match = body.match(/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)(?:\s|$)/);
   if (!match) return null;
   const script = match[1];
-  if (["install", "i", "ci", "add", "exec", "dlx"].includes(script)) return null;
+  if (script.startsWith("-") || ["install", "i", "ci", "add", "exec", "dlx"].includes(script)) return null;
   return script;
 }
 
