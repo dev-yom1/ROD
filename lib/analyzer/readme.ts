@@ -141,14 +141,25 @@ function flowScore(bucket: SectionBucket): number {
   return (hasStart ? 100 : 0) + (hasInstall ? 30 : 0) + (hasPreparation ? 5 : 0) + sectionBonus;
 }
 
+function trimFlowToTerminalFence(bucket: SectionBucket): SectionBucket {
+  const startFence = bucket.steps.find((step) => step.role === "start")?.fenceIndex;
+  const installFence = bucket.steps.find((step) => step.role === "install")?.fenceIndex;
+  const terminalFence = startFence ?? installFence ?? bucket.firstFenceIndex;
+  return {
+    ...bucket,
+    steps: bucket.steps.filter((step) => step.fenceIndex <= terminalFence),
+  };
+}
+
 function selectOnboardingFlow(markdown: string): SectionBucket | null {
   const buckets = parseSections(markdown);
   if (!buckets.length) return null;
-  return [...buckets].sort((a, b) => {
+  const selected = [...buckets].sort((a, b) => {
     const score = flowScore(b) - flowScore(a);
     if (score !== 0) return score;
     return a.firstFenceIndex - b.firstFenceIndex;
   })[0];
+  return trimFlowToTerminalFence(selected);
 }
 
 function extractRuntime(markdown: string, runtime: "node" | "python"): string | null {
