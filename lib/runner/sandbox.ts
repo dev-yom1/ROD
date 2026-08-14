@@ -1,10 +1,13 @@
 import { Sandbox } from "@vercel/sandbox";
 import { parseEnvScanOutput } from "../analyzer/env-scan";
-import { isSafeOnboardingCommand } from "../analyzer/readme";
+import {
+  parseOnboardingCommand,
+  readmeRuntimeKind,
+} from "../analyzer/readme";
 import {
   nodeReadmeRequirementFitsRepo,
   pythonReadmeRequirementFitsRepo,
-  selectNodeSandboxRuntime,
+  selectNodeSandboxRuntimes,
   supportsPython313,
 } from "../analyzer/runtime";
 import type {
@@ -13,6 +16,7 @@ import type {
   ReadmePlan,
   ReadmeStep,
   RepoFacts,
+  RuntimeKind,
   StepResult,
 } from "../analyzer/types";
 
@@ -31,29 +35,38 @@ export interface SandboxDiagnosisResult {
 }
 
 type SandboxRuntime = "node22" | "node24" | "node26" | "python3.13";
+type ListeningSockets = Map<number, Set<string>>;
 
-function chooseRuntime(facts: RepoFacts): { runtime: SandboxRuntime | null; issue: string | null } {
-  const isPythonProject = ["pip", "poetry", "uv"].includes(facts.packageManager ?? "")
-    || Boolean(facts.inferredStartCommand?.match(/^(?:python|python3|uvicorn|flask|poetry|uv)\b/));
+function executionRequirement(kind: RuntimeKind, facts: RepoFacts): string | null {
+  if (kind === "python") return facts.pythonRequirement ?? facts.pythonPreferredVersion ?? null;
+  return facts.nodeRequirement ?? facts.nodePreferredVersion ?? null;
+}
 
-  if (isPythonProject) {
-    if (!supportsPython313(facts.pythonRequirement)) {
+function runtimeCandidates(plan: ReadmePlan, facts: RepoFacts): { kind: RuntimeKind; runtimes: SandboxRuntime[]; issue: string | null } {
+  const kind = readmeRuntimeKind(plan)
+    ?? (facts.pythonPackageManager && !facts.nodePackageManager ? "python" : "node");
+  const requirement = executionRequirement(kind, facts);
+
+  if (kind === "python") {
+    if (!supportsPython313(requirement)) {
       return {
-        runtime: null,
-        issue: `Repository requires Python ${facts.pythonRequirement ?? "an unsupported version"}, while ROD currently provides Python 3.13 for execution.`,
+        kind,
+        runtimes: [],
+        issue: `Repository requires Python ${requirement ?? "an unsupported version"}, while ROD currently provides Python 3.13 for execution.`,
       };
     }
-    return { runtime: "python3.13", issue: null };
+    return { kind, runtimes: ["python3.13"], issue: null };
   }
 
-  const runtime = selectNodeSandboxRuntime(facts.nodeRequirement);
-  if (!runtime) {
+  const runtimes = selectNodeSandboxRuntimes(requirement);
+  if (!runtimes.length) {
     return {
-      runtime: null,
-      issue: `Repository requires Node.js ${facts.nodeRequirement ?? "an unsupported version"}, while ROD currently provides Node.js 22, 24, and 26.`,
+      kind,
+      runtimes: [],
+      issue: `Repository requires Node.js ${requirement ?? "an unsupported version"}, while ROD currently provides Node.js 22, 24, and 26.`,
     };
   }
-  return { runtime, issue: null };
+  return { kind, runtimes, issue: null };
 }
 
 function extractExactVersion(output: string): string | null {
@@ -78,25 +91,49 @@ async function readActualRuntimeVersion(sandbox: Sandbox, runtime: SandboxRuntim
 async function verifyActualRuntime(
   sandbox: Sandbox,
   runtime: SandboxRuntime,
+  kind: RuntimeKind,
   facts: RepoFacts,
 ): Promise<string | null> {
   const actualVersion = await readActualRuntimeVersion(sandbox, runtime);
-  const runtimeName = runtime === "python3.13" ? "Python" : "Node.js";
-  const requirement = runtime === "python3.13" ? facts.pythonRequirement : facts.nodeRequirement;
+  const runtimeName = kind === "python" ? "Python" : "Node.js";
+  const requirement = executionRequirement(kind, facts);
 
   if (!actualVersion) {
     return `ROD selected ${runtime}, but could not determine its exact ${runtimeName} version before running repository code.`;
   }
 
-  const satisfies = runtime === "python3.13"
+  const satisfies = kind === "python"
     ? pythonReadmeRequirementFitsRepo(requirement, actualVersion)
     : nodeReadmeRequirementFitsRepo(requirement, actualVersion);
-
   if (satisfies === true) return null;
   if (satisfies === null) {
     return `ROD could not safely evaluate repository ${runtimeName} requirement ${requirement ?? "(none)"} against the actual Sandbox version ${actualVersion}.`;
   }
-  return `Repository requires ${runtimeName} ${requirement ?? "an unsupported version"}, but the selected ROD Sandbox currently provides ${runtimeName} ${actualVersion}. Setup and start were skipped.`;
+  return `Repository requires ${runtimeName} ${requirement ?? "an unsupported version"}, but ${runtime} currently provides ${runtimeName} ${actualVersion}.`;
+}
+
+async function createCompatibleSandbox(
+  plan: ReadmePlan,
+  facts: RepoFacts,
+  exposedPorts: number[],
+): Promise<{ sandbox: Sandbox | null; issue: string | null }> {
+  const selection = runtimeCandidates(plan, facts);
+  if (!selection.runtimes.length) return { sandbox: null, issue: selection.issue };
+
+  let lastIssue: string | null = selection.issue;
+  for (const runtime of selection.runtimes) {
+    const sandbox = await Sandbox.create({
+      runtime,
+      timeout: SANDBOX_TIMEOUT_MS,
+      ports: exposedPorts,
+      env: { CI: "1", ROD_SANDBOX: "1" },
+    });
+    const issue = await verifyActualRuntime(sandbox, runtime, selection.kind, facts);
+    if (!issue) return { sandbox, issue: null };
+    lastIssue = issue;
+    await sandbox.stop().catch(() => undefined);
+  }
+  return { sandbox: null, issue: `${lastIssue ?? "No compatible Sandbox runtime was found"} Setup and start were skipped.` };
 }
 
 async function runShell(
@@ -135,10 +172,61 @@ async function detectRequiredEnv(sandbox: Sandbox): Promise<string[]> {
   return parseEnvScanOutput(scan.stdout);
 }
 
-async function preparePackageManager(sandbox: Sandbox, facts: RepoFacts): Promise<void> {
-  if (facts.packageManager === "pnpm" || facts.packageManager === "yarn") {
-    await runShell(sandbox, "corepack enable >/dev/null 2>&1 || true", PREP_TIMEOUT_SECONDS);
+function stripLeadingEnvAssignments(command: string): string {
+  let body = command.trim();
+  while (true) {
+    const match = body.match(/^[A-Z_][A-Z0-9_]*=[^\s]+\s+(.+)$/);
+    if (!match) return body;
+    body = match[1].trim();
   }
+}
+
+function executableForCommand(command: string): string | null {
+  const body = stripLeadingEnvAssignments(command);
+  const executable = body.match(/^([A-Za-z0-9_.+-]+)/)?.[1] ?? null;
+  if (!executable || ["cp", "copy", "mkdir", "touch"].includes(executable.toLowerCase())) return null;
+  return executable;
+}
+
+function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  const kind = readmeRuntimeKind(plan);
+  if (kind === "python") return facts.inferredPythonInstallCommand ?? facts.inferredInstallCommand;
+  if (kind === "node") return facts.inferredNodeInstallCommand ?? facts.inferredInstallCommand;
+  return facts.inferredInstallCommand;
+}
+
+function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
+  if (readmeRuntimeKind(plan) === "python") return null;
+  return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+}
+
+async function preflightRunnerTools(sandbox: Sandbox, plan: ReadmePlan, facts: RepoFacts): Promise<string | null> {
+  const commands = plan.steps.map((step) => step.command);
+  if (!plan.installCommand) {
+    const fallback = inferredInstallForPlan(plan, facts);
+    if (fallback) commands.push(fallback);
+  }
+  if (!plan.startCommand) {
+    const fallback = inferredStartForPlan(plan, facts);
+    if (fallback) commands.push(fallback);
+  }
+
+  const executables = [...new Set(commands.map(executableForCommand).filter((value): value is string => Boolean(value)))];
+  if (executables.some((tool) => ["pnpm", "yarn", "pnpx"].includes(tool))) {
+    const corepack = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1"] });
+    if (corepack.exitCode !== 0) return "The selected README flow requires pnpm/yarn tooling, but this Sandbox cannot enable Corepack.";
+  }
+
+  for (const executable of executables) {
+    const result = await sandbox.runCommand({
+      cmd: "bash",
+      args: ["-lc", `command -v ${executable} >/dev/null 2>&1`],
+    });
+    if (result.exitCode !== 0) {
+      return `The selected README flow requires ${executable}, but that executable is not available in the selected ROD Sandbox runtime.`;
+    }
+  }
+  return null;
 }
 
 function normalizePreparationCommand(command: string): string {
@@ -149,7 +237,18 @@ async function startApplication(sandbox: Sandbox, command: string): Promise<void
   await sandbox.writeFiles([
     {
       path: "/tmp/rod-start.sh",
-      content: Buffer.from(`#!/usr/bin/env bash\nset -o pipefail\necho $$ > /tmp/rod-start.pid\ncd ${REPO_DIR}\nexec ${command} > /tmp/rod-start.log 2>&1\n`),
+      content: Buffer.from([
+        "#!/usr/bin/env bash",
+        "set -o pipefail",
+        "rm -f /tmp/rod-start.exit",
+        "echo $$ > /tmp/rod-start.pid",
+        `cd ${REPO_DIR}`,
+        `${command} > /tmp/rod-start.log 2>&1`,
+        "code=$?",
+        "printf '%s\\n' \"$code\" > /tmp/rod-start.exit",
+        "exit \"$code\"",
+        "",
+      ].join("\n")),
       mode: 0o700,
     },
   ]);
@@ -157,58 +256,66 @@ async function startApplication(sandbox: Sandbox, command: string): Promise<void
     cmd: "/tmp/rod-start.sh",
     cwd: REPO_DIR,
     detached: true,
-    env: {
-      HOST: "0.0.0.0",
-      HOSTNAME: "0.0.0.0",
-    },
+    env: { HOST: "0.0.0.0", HOSTNAME: "0.0.0.0" },
   });
 }
 
 export function extractPortsFromStartCommand(command: string | null): number[] {
   if (!command) return [];
-  const ports = new Set<number>();
-  const patterns = [
-    /(?:^|\s)--port(?:=|\s+)(\d{2,5})(?=\s|$)/gi,
-    /(?:^|\s)-p\s+(\d{2,5})(?=\s|$)/gi,
-    /(?:^|\s)PORT=(\d{2,5})(?=\s|$)/g,
-  ];
-  for (const pattern of patterns) {
-    for (const match of command.matchAll(pattern)) {
-      const port = Number(match[1]);
-      if (Number.isInteger(port) && port > 0 && port <= 65535) ports.add(port);
-    }
-  }
-  return [...ports];
+  return parseOnboardingCommand(command).portHints;
 }
 
-async function readListeningPorts(sandbox: Sandbox): Promise<number[]> {
+async function readListeningSockets(sandbox: Sandbox): Promise<ListeningSockets> {
   const result = await sandbox.runCommand({
     cmd: "bash",
     args: [
       "-lc",
-      "awk 'NR > 1 && $4 == \"0A\" { split($2, a, \":\"); print a[2] }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | while IFS= read -r hex; do printf '%d\\n' \"0x$hex\"; done | sort -n -u",
+      "awk 'NR > 1 && $4 == \"0A\" { split($2, a, \":\"); print a[2], $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null",
     ],
   });
-  if (result.exitCode !== 0) return [];
-  return (await result.stdout())
-    .split(/\s+/)
-    .map((value) => Number(value))
-    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65535);
+  const sockets: ListeningSockets = new Map();
+  if (result.exitCode !== 0) return sockets;
+  for (const line of (await result.stdout()).split("\n")) {
+    const match = line.trim().match(/^([0-9A-Fa-f]+)\s+(\S+)$/);
+    if (!match) continue;
+    const port = Number.parseInt(match[1], 16);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+    const set = sockets.get(port) ?? new Set<string>();
+    set.add(match[2]);
+    sockets.set(port, set);
+  }
+  return sockets;
+}
+
+export function hasNewListener(
+  port: number,
+  current: ListeningSockets,
+  baseline: ListeningSockets,
+): boolean {
+  const currentInodes = current.get(port);
+  if (!currentInodes?.size) return false;
+  const baselineInodes = baseline.get(port);
+  if (!baselineInodes?.size) return true;
+  return [...currentInodes].some((inode) => !baselineInodes.has(inode));
 }
 
 function orderedProbePorts(
   exposedPorts: number[],
   preferredPort: number | null,
   commandPorts: number[],
-  listeningPorts: number[],
-  baselinePorts: Set<number>,
+  current: ListeningSockets,
+  baseline: ListeningSockets,
 ): number[] {
+  const listeningPorts = [...current.keys()].filter((port) => hasNewListener(port, current, baseline));
   return [...new Set([
     ...(preferredPort ? [preferredPort] : []),
     ...commandPorts,
     ...listeningPorts,
     ...exposedPorts,
-  ])].filter((port) => !baselinePorts.has(port));
+  ])].filter((port) => {
+    if (!baseline.has(port)) return true;
+    return hasNewListener(port, current, baseline);
+  });
 }
 
 async function probeLocalHttpStatus(sandbox: Sandbox, port: number): Promise<number | null> {
@@ -240,30 +347,19 @@ async function probeObservedUrl(
   exposedPorts: number[],
   preferredPort: number | null,
   startCommand: string,
-  baselinePorts: Set<number>,
+  baseline: ListeningSockets,
 ): Promise<{ port: number; url: string; status: number } | null> {
   const deadline = Date.now() + PROBE_TIMEOUT_MS;
   const commandPorts = extractPortsFromStartCommand(startCommand);
   let lastServerError: { port: number; url: string; status: number } | null = null;
 
   while (Date.now() < deadline) {
-    const listeningPorts = await readListeningPorts(sandbox);
-    const orderedPorts = orderedProbePorts(
-      exposedPorts,
-      preferredPort,
-      commandPorts,
-      listeningPorts,
-      baselinePorts,
-    );
-
-    for (const port of orderedPorts) {
+    const current = await readListeningSockets(sandbox);
+    const ports = orderedProbePorts(exposedPorts, preferredPort, commandPorts, current, baseline);
+    for (const port of ports) {
       const localStatus = await probeLocalHttpStatus(sandbox, port);
       if (localStatus === null) continue;
-      const observation = {
-        port,
-        url: observedUrlForPort(sandbox, port, exposedPorts),
-        status: localStatus,
-      };
+      const observation = { port, url: observedUrlForPort(sandbox, port, exposedPorts), status: localStatus };
       if (localStatus < 500) return observation;
       lastServerError = observation;
     }
@@ -273,11 +369,14 @@ async function probeObservedUrl(
 }
 
 async function readStartLog(sandbox: Sandbox): Promise<string> {
-  const logResult = await sandbox.runCommand({
-    cmd: "bash",
-    args: ["-lc", "tail -c 20000 /tmp/rod-start.log 2>/dev/null || true"],
-  });
-  return await logResult.stdout();
+  const result = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "tail -c 20000 /tmp/rod-start.log 2>/dev/null || true"] });
+  return await result.stdout();
+}
+
+async function readStartExitCode(sandbox: Sandbox): Promise<number | null> {
+  const result = await sandbox.runCommand({ cmd: "bash", args: ["-lc", "cat /tmp/rod-start.exit 2>/dev/null || true"] });
+  const value = Number((await result.stdout()).trim());
+  return Number.isInteger(value) ? value : null;
 }
 
 async function isStartProcessAlive(sandbox: Sandbox): Promise<boolean> {
@@ -290,33 +389,32 @@ async function isStartProcessAlive(sandbox: Sandbox): Promise<boolean> {
 
 function runtimeBlockedExecution(plan: ReadmePlan, runtimeIssue: string): ExecutionObservation {
   return {
-    preparation: [],
-    unsupportedCommands: [],
-    install: null,
-    startCommand: null,
-    startLog: "",
-    observedPort: null,
-    observedUrl: null,
-    httpStatus: null,
-    startupTimedOut: false,
-    runtimeIssue,
-    stepResults: plan.steps.map((step) => ({
-      stepId: step.id,
-      status: "blocked",
-      reason: "runtime-unsupported",
-    })),
-    preexistingPorts: [],
+    preparation: [], unsupportedCommands: [], install: null, startCommand: null, startLog: "",
+    observedPort: null, observedUrl: null, httpStatus: null, startupTimedOut: false,
+    runtimeIssue, runnerIssue: null,
+    stepResults: plan.steps.map((step) => ({ stepId: step.id, status: "blocked", reason: "runtime-unsupported" })),
+    preexistingPorts: [], startExitCode: null,
   };
 }
 
-function skippedResult(step: ReadmeStep, reason: "unsafe" | "unsupported" | "after-start" | "previous-failure"): StepResult {
+function runnerBlockedExecution(plan: ReadmePlan, runnerIssue: string): ExecutionObservation {
+  return {
+    preparation: [], unsupportedCommands: [], install: null, startCommand: null, startLog: "",
+    observedPort: null, observedUrl: null, httpStatus: null, startupTimedOut: false,
+    runtimeIssue: null, runnerIssue,
+    stepResults: plan.steps.map((step) => ({ stepId: step.id, status: "blocked", reason: "runner-tool-unsupported" })),
+    preexistingPorts: [], startExitCode: null,
+  };
+}
+
+function skippedResult(step: ReadmeStep, reason: "unsafe" | "unsupported" | "malformed" | "after-start" | "previous-failure"): StepResult {
   return { stepId: step.id, status: reason === "previous-failure" ? "blocked" : "skipped", reason };
 }
 
 function unsupportedCommandsFromSteps(plan: ReadmePlan, results: StepResult[]): string[] {
   const byId = new Map(plan.steps.map((step) => [step.id, step]));
   return results
-    .filter((result) => result.status === "skipped" && result.reason !== undefined)
+    .filter((result) => result.status === "skipped")
     .map((result) => byId.get(result.stepId)?.command)
     .filter((command): command is string => Boolean(command));
 }
@@ -326,46 +424,31 @@ export async function runSandboxDiagnosis(
   plan: ReadmePlan,
   facts: RepoFacts,
 ): Promise<SandboxDiagnosisResult> {
-  const selection = chooseRuntime(facts);
-  const documentedStart = plan.steps.find((step) => step.role === "start") ?? null;
-  const diagnosticStartCommand = documentedStart?.command ?? facts.inferredStartCommand;
+  const diagnosticStartCommand = plan.startCommand ?? inferredStartForPlan(plan, facts);
   const exposedPorts = [...new Set([
     ...COMMON_PORTS,
     ...(plan.expectedPort && plan.expectedPort > 0 && plan.expectedPort <= 65535 ? [plan.expectedPort] : []),
     ...extractPortsFromStartCommand(diagnosticStartCommand),
   ])];
 
-  const sandbox = await Sandbox.create({
-    runtime: selection.runtime ?? "node24",
-    timeout: SANDBOX_TIMEOUT_MS,
-    ports: exposedPorts,
-    env: {
-      CI: "1",
-      ROD_SANDBOX: "1",
-    },
-  });
+  const compatible = await createCompatibleSandbox(plan, facts, exposedPorts);
+  if (!compatible.sandbox) {
+    return { requiredEnv: [], execution: runtimeBlockedExecution(plan, compatible.issue ?? "No compatible runtime is available.") };
+  }
+  const sandbox = compatible.sandbox;
 
   try {
-    const actualRuntimeIssue = selection.runtime
-      ? await verifyActualRuntime(sandbox, selection.runtime, facts)
-      : selection.issue;
+    const runnerIssue = await preflightRunnerTools(sandbox, plan, facts);
+    if (runnerIssue) return { requiredEnv: [], execution: runnerBlockedExecution(plan, runnerIssue) };
 
     await sandbox.writeFiles([{ path: ARCHIVE_PATH, content: archive, mode: 0o600 }]);
     const extract = await sandbox.runCommand({
       cmd: "timeout",
       args: ["--signal=TERM", "30s", "bash", "-lc", `mkdir -p ${REPO_DIR} && tar -xzf ${ARCHIVE_PATH} -C ${REPO_DIR} --strip-components=1`],
     });
-    if (extract.exitCode !== 0) {
-      throw new Error(`Could not extract repository archive: ${await extract.stderr()}`);
-    }
+    if (extract.exitCode !== 0) throw new Error(`Could not extract repository archive: ${await extract.stderr()}`);
 
     const requiredEnv = await detectRequiredEnv(sandbox);
-    if (actualRuntimeIssue) {
-      return { requiredEnv, execution: runtimeBlockedExecution(plan, actualRuntimeIssue) };
-    }
-
-    await preparePackageManager(sandbox, facts);
-
     const stepResults: StepResult[] = [];
     const preparation: CommandObservation[] = [];
     let install: CommandObservation | null = null;
@@ -375,6 +458,7 @@ export async function runSandboxDiagnosis(
     let observedUrl: string | null = null;
     let httpStatus: number | null = null;
     let startupTimedOut = false;
+    let startExitCode: number | null = null;
     let preexistingPorts: number[] = [];
     let previousFailure = false;
     let afterStart = false;
@@ -389,7 +473,12 @@ export async function runSandboxDiagnosis(
         stepResults.push(skippedResult(step, "previous-failure"));
         continue;
       }
-      if (!isSafeOnboardingCommand(step.command)) {
+      const parsed = parseOnboardingCommand(step.command, step.malformed);
+      if (step.malformed) {
+        stepResults.push(skippedResult(step, "malformed"));
+        continue;
+      }
+      if (!parsed.safe || !parsed.executable) {
         stepResults.push(skippedResult(step, "unsafe"));
         if (step.role === "start") afterStart = true;
         continue;
@@ -400,19 +489,10 @@ export async function runSandboxDiagnosis(
       }
 
       if (step.role === "preparation") {
-        const observation = await runShell(
-          sandbox,
-          normalizePreparationCommand(step.command),
-          PREP_TIMEOUT_SECONDS,
-          step.command,
-        );
+        const observation = await runShell(sandbox, normalizePreparationCommand(step.command), PREP_TIMEOUT_SECONDS, step.command);
         preparation.push(observation);
         const failed = commandFailed(observation);
-        stepResults.push({
-          stepId: step.id,
-          status: failed ? "failed" : "executed",
-          observation,
-        });
+        stepResults.push({ stepId: step.id, status: failed ? "failed" : "executed", observation });
         previousFailure = failed;
         continue;
       }
@@ -422,46 +502,38 @@ export async function runSandboxDiagnosis(
         const observation = await runShell(sandbox, step.command, INSTALL_TIMEOUT_SECONDS);
         install = observation;
         const failed = commandFailed(observation);
-        stepResults.push({
-          stepId: step.id,
-          status: failed ? "failed" : "executed",
-          observation,
-        });
+        stepResults.push({ stepId: step.id, status: failed ? "failed" : "executed", observation });
         previousFailure = failed;
         continue;
       }
 
       if (step.role === "start") {
-        if (!documentedInstallAttempted && facts.inferredInstallCommand && isSafeOnboardingCommand(facts.inferredInstallCommand)) {
-          const fallbackInstall = await runShell(sandbox, facts.inferredInstallCommand, INSTALL_TIMEOUT_SECONDS);
-          install = fallbackInstall;
-          if (commandFailed(fallbackInstall)) {
-            stepResults.push({ stepId: step.id, status: "blocked", reason: "previous-failure" });
-            previousFailure = true;
-            afterStart = true;
-            continue;
+        if (!documentedInstallAttempted) {
+          const fallbackInstall = inferredInstallForPlan(plan, facts);
+          if (fallbackInstall && parseOnboardingCommand(fallbackInstall).safe) {
+            install = await runShell(sandbox, fallbackInstall, INSTALL_TIMEOUT_SECONDS);
+            if (commandFailed(install)) {
+              stepResults.push({ stepId: step.id, status: "blocked", reason: "previous-failure" });
+              previousFailure = true;
+              afterStart = true;
+              continue;
+            }
           }
         }
 
         startCommand = step.command;
-        const baseline = await readListeningPorts(sandbox);
-        preexistingPorts = baseline;
-        const baselineSet = new Set(baseline);
+        const baseline = await readListeningSockets(sandbox);
+        preexistingPorts = [...baseline.keys()].sort((a, b) => a - b);
         await startApplication(sandbox, step.command);
-        const probe = await probeObservedUrl(
-          sandbox,
-          exposedPorts,
-          plan.expectedPort,
-          step.command,
-          baselineSet,
-        );
+        const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort, step.command, baseline);
         startLog = await readStartLog(sandbox);
+        startExitCode = await readStartExitCode(sandbox);
         if (probe) {
           observedPort = probe.port;
           observedUrl = probe.url;
           httpStatus = probe.status;
         } else {
-          startupTimedOut = await isStartProcessAlive(sandbox);
+          startupTimedOut = startExitCode === null && await isStartProcessAlive(sandbox);
         }
         const startSucceeded = Boolean(probe && probe.status < 500);
         stepResults.push({ stepId: step.id, status: startSucceeded ? "executed" : "failed" });
@@ -469,31 +541,31 @@ export async function runSandboxDiagnosis(
       }
     }
 
-    if (!afterStart && !previousFailure && facts.inferredStartCommand && isSafeOnboardingCommand(facts.inferredStartCommand)) {
-      if (!documentedInstallAttempted && facts.inferredInstallCommand && isSafeOnboardingCommand(facts.inferredInstallCommand)) {
-        install = await runShell(sandbox, facts.inferredInstallCommand, INSTALL_TIMEOUT_SECONDS);
-        previousFailure = commandFailed(install);
-      }
-      if (!previousFailure) {
-        startCommand = facts.inferredStartCommand;
-        const baseline = await readListeningPorts(sandbox);
-        preexistingPorts = baseline;
-        const baselineSet = new Set(baseline);
-        await startApplication(sandbox, startCommand);
-        const probe = await probeObservedUrl(
-          sandbox,
-          exposedPorts,
-          plan.expectedPort,
-          startCommand,
-          baselineSet,
-        );
-        startLog = await readStartLog(sandbox);
-        if (probe) {
-          observedPort = probe.port;
-          observedUrl = probe.url;
-          httpStatus = probe.status;
-        } else {
-          startupTimedOut = await isStartProcessAlive(sandbox);
+    if (!afterStart && !previousFailure) {
+      const fallbackStart = inferredStartForPlan(plan, facts);
+      if (fallbackStart && parseOnboardingCommand(fallbackStart).safe) {
+        if (!documentedInstallAttempted) {
+          const fallbackInstall = inferredInstallForPlan(plan, facts);
+          if (fallbackInstall && parseOnboardingCommand(fallbackInstall).safe) {
+            install = await runShell(sandbox, fallbackInstall, INSTALL_TIMEOUT_SECONDS);
+            previousFailure = commandFailed(install);
+          }
+        }
+        if (!previousFailure) {
+          startCommand = fallbackStart;
+          const baseline = await readListeningSockets(sandbox);
+          preexistingPorts = [...baseline.keys()].sort((a, b) => a - b);
+          await startApplication(sandbox, fallbackStart);
+          const probe = await probeObservedUrl(sandbox, exposedPorts, plan.expectedPort, fallbackStart, baseline);
+          startLog = await readStartLog(sandbox);
+          startExitCode = await readStartExitCode(sandbox);
+          if (probe) {
+            observedPort = probe.port;
+            observedUrl = probe.url;
+            httpStatus = probe.status;
+          } else {
+            startupTimedOut = startExitCode === null && await isStartProcessAlive(sandbox);
+          }
         }
       }
     }
@@ -511,11 +583,15 @@ export async function runSandboxDiagnosis(
         httpStatus,
         startupTimedOut,
         runtimeIssue: null,
+        runnerIssue: null,
         stepResults,
         preexistingPorts,
+        startExitCode,
       },
     };
   } finally {
-    await sandbox.stop();
+    await sandbox.stop().catch((error) => {
+      console.warn("[ROD sandbox] cleanup failed after diagnosis", error);
+    });
   }
 }
