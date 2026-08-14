@@ -43,7 +43,8 @@ test("safe but unclassified README command is reported as unreproduced", () => {
   assert.equal(isSafeOnboardingCommand("npm run db:migrate"), true);
   const findings = diagnose(readme, plan, FACTS, run);
   assert(findings.some((finding) => (
-    finding.code === "RUNNER_COMMAND_UNSUPPORTED" && finding.detail.includes("npm run db:migrate")
+    finding.code === "RUNNER_COMMAND_UNSUPPORTED"
+    && finding.evidence?.includes("npm run db:migrate")
   )));
 });
 
@@ -82,6 +83,7 @@ test("chained env copy is neither recognized nor accepted as reproduced env setu
   assert.equal(plan.copiesEnvExample, false);
   assert(findings.some((finding) => finding.code === "ENV_MISSING"));
   assert(findings.some((finding) => (
-    finding.code === "RUNNER_COMMAND_UNSUPPORTED" && finding.detail.includes(command)
+    finding.code === "RUNNER_COMMAND_UNSUPPORTED"
+    && finding.evidence?.includes(command)
   )));
 });
