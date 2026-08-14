@@ -6,7 +6,7 @@ function source(path: string): string {
   return readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 }
 
-test("Sandbox reachability probing does not depend on optional socket tools", () => {
+test("Sandbox reachability probing discovers listeners without optional socket tools", () => {
   const sandbox = source("lib/runner/sandbox.ts");
 
   assert.doesNotMatch(sandbox, /\bss -ltnH\b/);
@@ -15,7 +15,9 @@ test("Sandbox reachability probing does not depend on optional socket tools", ()
   assert.match(sandbox, /\/proc\/net\/tcp6/);
   assert.match(sandbox, /\/dev\/tcp\/127\.0\.0\.1/);
   assert.match(sandbox, /extractPortsFromStartCommand\(startCommand\)/);
-  assert.match(sandbox, /orderedProbePorts\(exposedPorts, preferredPort, commandPorts, listeningPorts\)/);
+  assert.match(sandbox, /baselinePorts: Set<number>/);
+  assert.match(sandbox, /filter\(\(port\) => !baselinePorts\.has\(port\)\)/);
+  assert.match(sandbox, /const baseline = await readListeningPorts\(sandbox\)/);
   assert.match(sandbox, /sandbox\.domain\(port\)/);
 });
 
