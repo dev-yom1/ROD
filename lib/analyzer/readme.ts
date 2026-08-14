@@ -1,7 +1,7 @@
 import type { ReadmePlan } from "./types";
 
 const SHELL_FENCE = /```(?:bash|sh|shell|zsh|console)?\s*\n([\s\S]*?)```/gi;
-const ENV_COPY = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?(?:\s|$)/i;
+const ENV_COPY = /^(?:cp|copy)\s+\.env(?:\.example|\.sample)\s+\.env(?:\.local|\.development\.local)?\s*$/i;
 
 function cleanShellLine(line: string): string | null {
   const cleaned = line.trim().replace(/^\$\s+/, "");
