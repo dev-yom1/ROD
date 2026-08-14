@@ -37,6 +37,12 @@ type SectionBucket = {
   fences: ParsedFence[];
   steps: ReadmeStep[];
 };
+type SelectedFlow = {
+  steps: ReadmeStep[];
+  text: string;
+  sections: string[];
+  issue: string | null;
+};
 
 function cleanShellLine(line: string): string | null {
   const cleaned = line.trim().replace(/^\$\s+/, "");
@@ -106,7 +112,7 @@ function commandToolFamily(command: string): string | null {
   if (executable === "npx") return "npm";
   if (executable === "pnpx") return "pnpm";
   if (executable === "bunx") return "bun";
-  if (executable === "python" || executable === "python3" || executable === "pip" || executable === "pip3") return "pip";
+  if (["python", "python3", "pip", "pip3"].includes(executable)) return "pip";
   return executable;
 }
 
@@ -133,6 +139,16 @@ function nestedPythonStart(body: string): boolean {
   return /^(?:uvicorn\b|flask\s+run\b|(?:python|python3)\s+[^\n]*(?:app|server|main)\.py(?:\s|$))/i.test(body);
 }
 
+function wrappedNodeRole(body: string): ReadmeStepRole | null {
+  const wrapped = body.match(/^(?:npx|pnpx|bunx)\s+(next|vite)(?:\s+([^\s]+))?(?:\s|$)/i);
+  if (!wrapped) return null;
+  const framework = wrapped[1].toLowerCase();
+  const subcommand = wrapped[2]?.toLowerCase() ?? null;
+  if (framework === "next") return subcommand === "dev" || subcommand === "start" ? "start" : "other";
+  if (framework === "vite") return subcommand === null || subcommand === "dev" || subcommand === "serve" ? "start" : "other";
+  return "other";
+}
+
 export function parseOnboardingCommand(command: string, malformed = false): ParsedOnboardingCommand {
   const hints = portHints(command);
   if (malformed || !command.trim() || blockedShellSyntax(command)) {
@@ -155,10 +171,32 @@ export function parseOnboardingCommand(command: string, malformed = false): Pars
     return { role: "preparation", safe: true, executable: true, runtime: null, envCopySource: null, portHints: hints };
   }
 
+  const nodeStart = [
+    /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start)(?:\s|$)/i,
+  ].some((pattern) => pattern.test(body));
+  if (nodeStart) {
+    return { role: "start", safe: true, executable: true, runtime: "node", envCopySource: null, portHints: hints };
+  }
+
+  const wrappedNode = wrappedNodeRole(body);
+  if (wrappedNode) {
+    return { role: wrappedNode, safe: true, executable: true, runtime: "node", envCopySource: null, portHints: hints };
+  }
+
+  if (nestedPythonStart(body)) {
+    return { role: "start", safe: true, executable: true, runtime: "python", envCopySource: null, portHints: hints };
+  }
+  const wrappedPython = body.match(/^(?:poetry|uv)\s+run\s+(.+)$/i);
+  if (wrappedPython && nestedPythonStart(wrappedPython[1])) {
+    return { role: "start", safe: true, executable: true, runtime: "python", envCopySource: null, portHints: hints };
+  }
+
   const nodeInstall = [
     /^npm\s+(?:ci|install|i)(?:\s|$)/i,
     /^pnpm\s+(?:install|i)(?:\s|$)/i,
-    /^yarn(?:\s+install)?(?:\s|$)/i,
+    /^yarn\s*$/i,
+    /^yarn\s+install(?:\s|$)/i,
+    /^yarn\s+--(?:immutable|immutable-cache|check-cache|frozen-lockfile)(?:[=\s]|$)/i,
     /^bun\s+install(?:\s|$)/i,
   ].some((pattern) => pattern.test(body));
   if (nodeInstall) {
@@ -175,24 +213,7 @@ export function parseOnboardingCommand(command: string, malformed = false): Pars
     return { role: "install", safe: true, executable: true, runtime: "python", envCopySource: null, portHints: hints };
   }
 
-  const nodeStart = [
-    /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start)(?:\s|$)/i,
-    /^(?:npx|pnpx|bunx)\s+(?:next|vite)(?:\s+(?:dev|start))?(?:\s|$)/i,
-  ].some((pattern) => pattern.test(body));
-  if (nodeStart) {
-    return { role: "start", safe: true, executable: true, runtime: "node", envCopySource: null, portHints: hints };
-  }
-
-  if (nestedPythonStart(body)) {
-    return { role: "start", safe: true, executable: true, runtime: "python", envCopySource: null, portHints: hints };
-  }
-  const wrappedPython = body.match(/^(?:poetry|uv)\s+run\s+(.+)$/i);
-  if (wrappedPython && nestedPythonStart(wrappedPython[1])) {
-    return { role: "start", safe: true, executable: true, runtime: "python", envCopySource: null, portHints: hints };
-  }
-
-  if (/^(?:npm|pnpm|yarn|bun)(?:\s|$)/i.test(body)
-    || /^(?:npx|pnpx|bunx)\s+(?:next|vite)(?:\s|$)/i.test(body)) {
+  if (/^(?:npm|pnpm|yarn|bun)(?:\s|$)/i.test(body)) {
     return { role: "other", safe: true, executable: true, runtime: "node", envCopySource: null, portHints: hints };
   }
   if (/^(?:poetry\s+run|uv\s+run)(?:\s|$)/i.test(body)) {
@@ -293,39 +314,15 @@ function isSetupBucket(bucket: SectionBucket): boolean {
   return /\b(?:installation|install|setup|environment|prerequisites?|requirements?|getting started|quick ?start)\b/i.test(bucket.section);
 }
 
-function installStepScore(step: ReadmeStep, terminalStart: ReadmeStep): number {
-  const install = parseOnboardingCommand(step.command, step.malformed);
-  const start = parseOnboardingCommand(terminalStart.command, terminalStart.malformed);
-  let score = 0;
-  if (install.runtime && start.runtime && install.runtime === start.runtime) score += 100;
-  if (commandToolFamily(step.command) === commandToolFamily(terminalStart.command)) score += 200;
-  return score;
-}
-
-function selectedSetupSteps(bucket: SectionBucket, terminalStart: ReadmeStep): ReadmeStep[] {
-  const installs = bucket.steps.filter((step) => step.role === "install");
-  if (installs.length <= 1) return bucket.steps;
-  const selected = installs
-    .slice()
-    .sort((a, b) => {
-      const score = installStepScore(b, terminalStart) - installStepScore(a, terminalStart);
-      if (score !== 0) return score;
-      return a.line - b.line;
-    })[0];
-  return bucket.steps.filter((step) => step.role !== "install" || step.id === selected.id);
-}
-
-function setupBucketScore(bucket: SectionBucket, terminalStart: ReadmeStep, terminal: SectionBucket): number {
-  const installs = bucket.steps.filter((step) => step.role === "install");
-  const bestInstallScore = installs.length
-    ? Math.max(...installs.map((step) => installStepScore(step, terminalStart)))
-    : 0;
-  const headingToolBonus = commandToolFamily(terminalStart.command)
-    && bucket.section?.toLowerCase().includes(commandToolFamily(terminalStart.command) ?? "")
-    ? 50
-    : 0;
-  const proximity = Math.max(0, 50 - Math.max(0, terminal.startLine - bucket.startLine));
-  return bestInstallScore + headingToolBonus + proximity;
+function explicitVariantFamily(bucket: SectionBucket): string | null {
+  const section = bucket.section?.toLowerCase() ?? "";
+  if (!section) return null;
+  const families = ["npm", "pnpm", "yarn", "bun", "pip", "poetry", "uv"];
+  for (const family of families) {
+    const variant = new RegExp(`(?:\\b(?:with|using|for)\\s+${family}\\b|\\b${family}\\s+(?:installation|install|setup)\\b|^(?:${family})$)`, "i");
+    if (variant.test(section)) return family;
+  }
+  return null;
 }
 
 function proseThroughStartFence(markdown: string, bucket: SectionBucket, terminalFence: ParsedFence): string[] {
@@ -339,7 +336,7 @@ function proseThroughStartFence(markdown: string, bucket: SectionBucket, termina
   return bucket.lines.filter((item) => item.line <= endLine).map((item) => item.text);
 }
 
-function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: string; sections: string[] } | null {
+function selectOnboardingFlow(markdown: string): SelectedFlow | null {
   const buckets = parseSections(markdown);
   if (!buckets.length) return null;
 
@@ -355,8 +352,9 @@ function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: st
 
   const terminalFence = terminal.fences.find((fence) => fence.steps.some((step) => step.role === "start"))
     ?? terminal.fences[terminal.fences.length - 1];
-  const terminalStart = terminalFence.steps.find((step) => step.role === "start")
-    ?? terminal.steps.find((step) => step.role === "start");
+  const terminalStarts = terminalFence.steps.filter((step) => step.role === "start");
+  const terminalStart = terminalStarts[0] ?? terminal.steps.find((step) => step.role === "start") ?? null;
+
   if (!terminalStart) {
     const terminalSteps = terminal.fences
       .filter((fence) => fence.index <= terminalFence.index)
@@ -365,6 +363,7 @@ function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: st
       steps: terminalSteps,
       text: proseThroughStartFence(markdown, terminal, terminalFence).join("\n"),
       sections: terminal.section ? [terminal.section] : [],
+      issue: null,
     };
   }
 
@@ -372,17 +371,30 @@ function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: st
     bucket.startLine < terminal.startLine && isSetupBucket(bucket)
   ));
   const installBuckets = setupCandidates.filter((bucket) => bucket.steps.some((step) => step.role === "install"));
-  const selectedInstallBucket = installBuckets
-    .slice()
-    .sort((a, b) => {
-      const score = setupBucketScore(b, terminalStart, terminal) - setupBucketScore(a, terminalStart, terminal);
-      if (score !== 0) return score;
-      return b.startLine - a.startLine;
-    })[0] ?? null;
-  const setupBuckets = setupCandidates.filter((bucket) => (
-    !bucket.steps.some((step) => step.role === "install") || bucket === selectedInstallBucket
-  ));
-  const setupSteps = setupBuckets.flatMap((bucket) => selectedSetupSteps(bucket, terminalStart));
+  const variantBuckets = installBuckets.filter((bucket) => explicitVariantFamily(bucket) !== null);
+  const terminalFamily = commandToolFamily(terminalStart.command);
+  let selectedVariant: SectionBucket | null = null;
+  let flowIssue: string | null = null;
+
+  if (variantBuckets.length > 1) {
+    const matching = variantBuckets.filter((bucket) => explicitVariantFamily(bucket) === terminalFamily);
+    if (matching.length === 1) {
+      selectedVariant = matching[0];
+    } else {
+      flowIssue = `ROD found multiple explicit setup variants before the selected start flow and could not choose exactly one for ${terminalFamily ?? "the start command"}.`;
+    }
+  }
+
+  if (terminalStarts.length > 1) {
+    flowIssue = "ROD found multiple start commands in the same README shell fence and cannot safely infer which alternative onboarding path to execute.";
+  }
+
+  const setupBuckets = setupCandidates.filter((bucket) => {
+    if (variantBuckets.length <= 1) return true;
+    if (!variantBuckets.includes(bucket)) return true;
+    return bucket === selectedVariant;
+  });
+  const setupSteps = setupBuckets.flatMap((bucket) => bucket.steps);
   const terminalSteps = terminal.fences
     .filter((fence) => fence.index <= terminalFence.index)
     .flatMap((fence) => fence.steps);
@@ -394,7 +406,7 @@ function selectOnboardingFlow(markdown: string): { steps: ReadmeStep[]; text: st
   const sections = [...setupBuckets, terminal]
     .map((bucket) => bucket.section)
     .filter((section): section is string => Boolean(section));
-  return { steps, text: textParts.join("\n"), sections };
+  return { steps, text: textParts.join("\n"), sections, issue: flowIssue };
 }
 
 function extractRuntime(markdown: string, runtime: "node" | "python"): string | null {
@@ -412,7 +424,7 @@ function extractRuntime(markdown: string, runtime: "node" | "python"): string | 
       return `>=${matches[0].replace(/\+$/, "").replace(/^[=\s]+/, "")}`;
     }
 
-    const alternatives = tail.split(/\bor\b/i);
+    const alternatives = tail.split(/\s*(?:\|\||\bor\b)\s*/i);
     if (alternatives.length > 1) {
       const groups = alternatives.map((alternative) => (
         [...alternative.matchAll(token)].map((match) => match[0].trim()).filter(Boolean).join(" ")
@@ -441,10 +453,11 @@ export function extractReadmePlan(markdown: string): ReadmePlan {
     startCommand: startStep?.command ?? null,
     expectedPort,
     expectedUrl,
-    nodeRequirement: extractRuntime(markdown, "node"),
-    pythonRequirement: extractRuntime(markdown, "python"),
+    nodeRequirement: extractRuntime(flowText, "node"),
+    pythonRequirement: extractRuntime(flowText, "python"),
     copiesEnvExample: steps.some((step) => parseOnboardingCommand(step.command, step.malformed).envCopySource !== null),
     flowSections: flow?.sections ?? [],
+    flowIssue: flow?.issue ?? null,
   };
 }
 
