@@ -34,7 +34,8 @@ test("stale retry settles an existing Workflow Check before returning", () => {
   const orchestrator = source("lib/orchestrator/diagnose-pr.ts");
   assert.match(orchestrator, /if \(initialHeadSha !== input\.headSha\)[\s\S]*obsoleteWorkflowCheckIfPresent\(/);
   assert.match(orchestrator, /obsoleteWorkflowCheckIfPresent\([\s\S]*context\.workflowRunId[\s\S]*initialHeadSha/);
-  assert.match(orchestrator, /runSandboxDiagnosis\(archive, plan, initialFacts\)/);
+  assert.match(orchestrator, /plan\.flowIssue[\s\S]*ambiguousFlowExecution\(plan\)[\s\S]*runSandboxDiagnosis\(/);
+  assert.match(orchestrator, /downloadRepositoryArchive\([\s\S]*input\.headSha/);
 });
 
 test("repository metadata uses authenticated Octokit raw-content requests", () => {
