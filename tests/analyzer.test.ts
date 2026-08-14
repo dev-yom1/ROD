@@ -72,7 +72,7 @@ test("reports missing install step and runtime documentation", () => {
   assert(findings.some((finding) => finding.code === "RUNTIME_UNDOCUMENTED"));
 });
 
-test("supports root env example copies to Next.js env destinations", () => {
+test("supports successful root env example copies to Next.js env destinations", () => {
   for (const destination of [".env", ".env.local", ".env.development.local"]) {
     const command = `cp .env.example ${destination}`;
     const readme = `# App\n\n\`\`\`bash\n${command}\nnpm ci\n\`\`\``;
@@ -87,9 +87,14 @@ test("supports root env example copies to Next.js env destinations", () => {
       envExample: "DATABASE_URL=\n",
       requiredEnv: ["DATABASE_URL"],
     });
+    const run: ExecutionObservation = {
+      ...EMPTY_RUN,
+      preparation: [{ command, exitCode: 0, stdout: "", stderr: "", timedOut: false }],
+      install: { command: "npm ci", exitCode: 0, stdout: "", stderr: "", timedOut: false },
+    };
     assert.equal(plan.copiesEnvExample, true);
     assert.equal(isSafeOnboardingCommand(command), true);
-    assert(!diagnose(readme, plan, facts, EMPTY_RUN).some((finding) => finding.code === "ENV_MISSING"));
+    assert(!diagnose(readme, plan, facts, run).some((finding) => finding.code === "ENV_MISSING"));
   }
   assert.equal(isSafeOnboardingCommand("cp .env.example ../.env"), false);
 });
