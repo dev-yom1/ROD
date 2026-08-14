@@ -2,6 +2,7 @@ import {
   npmScriptReferencedByCommand,
   parseOnboardingCommand,
   readmeRuntimeKind,
+  readmeRuntimeKinds,
 } from "./readme";
 import { nodeReadmeRequirementFitsRepo, pythonReadmeRequirementFitsRepo } from "./runtime";
 import type {
@@ -111,16 +112,18 @@ function preexistingExpectedPortConflict(plan: ReadmePlan, run: ExecutionObserva
 }
 
 function inferredInstallForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
-  const runtime = readmeRuntimeKind(plan);
+  const runtimes = readmeRuntimeKinds(plan);
+  if (runtimes.length > 1) return null;
+  const runtime = runtimes[0] ?? readmeRuntimeKind(plan);
   if (runtime === "python") return facts.inferredPythonInstallCommand ?? null;
   if (runtime === "node") return facts.inferredNodeInstallCommand ?? null;
   return facts.inferredInstallCommand;
 }
 
 function inferredStartForPlan(plan: ReadmePlan, facts: RepoFacts): string | null {
-  const runtime = readmeRuntimeKind(plan);
-  if (runtime === "python") return null;
-  if (runtime === "node") return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  const runtimes = readmeRuntimeKinds(plan);
+  if (runtimes.includes("node")) return facts.inferredNodeStartCommand ?? facts.inferredStartCommand;
+  if (runtimes.length === 1 && runtimes[0] === "python") return null;
   return facts.inferredStartCommand;
 }
 
