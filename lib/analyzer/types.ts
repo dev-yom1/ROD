@@ -83,6 +83,8 @@ export interface ReadmePlan {
   copiesEnvExample: boolean;
   flowSections?: string[];
   flowIssue?: string | null;
+  flowText?: string;
+  terminalText?: string;
 }
 
 export interface RepoFacts {
