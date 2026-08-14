@@ -14,6 +14,8 @@ export type FindingCode =
   | "RUNNER_TIMEOUT"
   | "PORT_MISMATCH"
   | "START_URL_UNDOCUMENTED"
+  | "START_PORT_UNDOCUMENTED"
+  | "FLOW_AMBIGUOUS"
   | "DOC_STALE";
 
 export type FindingSeverity = "error" | "warning" | "info";
@@ -51,6 +53,7 @@ export type StepResultReason =
   | "after-start"
   | "runtime-unsupported"
   | "runner-tool-unsupported"
+  | "flow-ambiguous"
   | "previous-failure";
 
 export interface CommandObservation {
@@ -79,6 +82,7 @@ export interface ReadmePlan {
   pythonRequirement: string | null;
   copiesEnvExample: boolean;
   flowSections?: string[];
+  flowIssue?: string | null;
 }
 
 export interface RepoFacts {
